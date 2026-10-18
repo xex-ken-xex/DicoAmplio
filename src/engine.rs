@@ -190,6 +190,27 @@ pub struct Idx {
     pub i: u32,
 }
 
+/// 送信の接続 1 本の、いまの状態。画面の「接続の状態」用。
+#[derive(Clone, Debug, Default)]
+pub struct WorkerStatus {
+    /// いま送っているまとまり。何もしていなければ None
+    pub group: Option<String>,
+    pub done: u64,
+    pub total: u64,
+    pub started: Option<std::time::Instant>,
+}
+
+/// 送り終えたまとまり 1 つの結果。
+#[derive(Clone, Debug)]
+pub struct GroupResult {
+    pub label: String,
+    pub count: u64,
+    pub sent: u64,
+    pub rejected: u64,
+    pub secs: f64,
+    pub error: Option<String>,
+}
+
 /// 実行の進み具合。別スレッドの画面から読む。
 #[derive(Default)]
 pub struct Progress {
@@ -199,9 +220,32 @@ pub struct Progress {
     pub log: Mutex<Vec<String>>,
     /// 標準エラーにも出す(コマンドライン用)
     pub echo: bool,
+    /// 送信の接続ごとの状態(接続の数だけ)
+    pub workers: Mutex<Vec<WorkerStatus>>,
+    /// 送り終えたまとまりの結果
+    pub results: Mutex<Vec<GroupResult>>,
+    /// 接続ごとの端末風のログ(`[  12.345] …`。実行の始まりからの秒)
+    pub worker_logs: Mutex<Vec<Vec<String>>>,
+    pub started: Mutex<Option<std::time::Instant>>,
 }
 
+/// 接続のログに残す行数の上限。1 万件を送ると 1 万行になるので、古いものから捨てる
+const WORKER_LOG_LINES: usize = 3000;
+
 impl Progress {
+    /// 接続 `k` の端末風のログに 1 行足す。
+    pub fn wlog(&self, k: usize, msg: impl Into<String>) {
+        let secs = self.started.lock().unwrap().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+        let line = format!("[{secs:8.3}] {}", msg.into());
+        let mut logs = self.worker_logs.lock().unwrap();
+        if let Some(l) = logs.get_mut(k) {
+            if l.len() >= WORKER_LOG_LINES {
+                l.drain(..WORKER_LOG_LINES / 10);
+            }
+            l.push(line);
+        }
+    }
+
     pub fn say(&self, msg: impl Into<String>) {
         let msg = msg.into();
         if self.echo {
@@ -513,7 +557,42 @@ impl Engine {
     /// アソシエーションを張り、複製を作りながら送り、送り切ったら解放する。
     fn run_store(&self, tree: &tree::SourceTree, files: &[PathBuf], progress: &Progress) -> Result<u64> {
         let groups = self.groups(tree, files);
+        self.send_groups(groups, progress)
+    }
+
+    /// 水増しも書き換えもせず、ディレクトリの DICOM をそのまま送る(storescu と同じ)。
+    pub fn run_send_as_is(&self, progress: &Progress) -> Result<u64> {
+        let dir = self.cfg.store.as_is_dir.trim();
+        let files = list_sources(dir).with_context(|| "そのまま送るディレクトリ")?;
+        let tree = tree::scan(&files, &AtomicBool::new(false), &AtomicU64::new(0));
+        let c = tree.counts();
+        progress.total.store(tree.files as u64, Ordering::Relaxed);
+        progress.say(format!("そのまま送る: {} 患者 / {} 検査 / {} シリーズ / {} 画像({} ファイル)", c.patients, c.studies, c.series, c.images, tree.files));
+        for s in &tree.skipped {
+            progress.say(format!("飛ばした: {s}"));
+        }
+        // 複製の番号は使わないので、全部 0 のまま。単位の分け方(モダリティ・検査…)はそのまま効く
+        let one = Engine { cfg: Config { patients: 1, studies: 1, series: 1, images: 1, ..self.cfg.clone() }, ..self.shallow() };
+        let groups = one.groups(&tree, &files);
+        one.send_groups_with(groups, progress, true)
+    }
+
+    /// 設定だけを引き継いだ Engine(規則・CSV は空)。そのまま送るときに、件数を 1 にしたものを作るため。
+    fn shallow(&self) -> Engine {
+        Engine { cfg: self.cfg.clone(), ns: self.ns, rules: vec![], csv_columns: vec![], csv_rows: 0, tables: HashMap::new() }
+    }
+
+    fn send_groups(&self, groups: Vec<Group>, progress: &Progress) -> Result<u64> {
+        self.send_groups_with(groups, progress, false)
+    }
+
+    fn send_groups_with(&self, groups: Vec<Group>, progress: &Progress, as_is: bool) -> Result<u64> {
         let cfg = &self.cfg.store;
+        let n = cfg.connections.max(1) as usize;
+        *progress.workers.lock().unwrap() = vec![WorkerStatus::default(); n];
+        *progress.worker_logs.lock().unwrap() = vec![vec![]; n];
+        *progress.started.lock().unwrap() = Some(std::time::Instant::now());
+        progress.results.lock().unwrap().clear();
         progress.say(format!(
             "C-STORE {} へ、{} を単位に {} 本のアソシエーション({} 接続まで同時)で送る",
             cfg.target(),
@@ -527,7 +606,7 @@ impl Engine {
                 .map(|k| {
                     let (next, groups) = (&next, &groups);
                     scope.spawn(move || {
-                        let r = self.store_worker(k, groups, next, progress);
+                        let r = self.store_worker(k, groups, next, progress, as_is);
                         if let Err(e) = &r {
                             progress.say(format!("エラー: 接続 {}: {e:#}", k + 1));
                             // ほかの接続も止める。残りを送っても結果が片手落ちになるため
@@ -566,8 +645,7 @@ impl Engine {
         Ok(total.sent)
     }
 
-    fn store_worker(&self, k: usize, groups: &[Group], next: &std::sync::atomic::AtomicUsize, progress: &Progress) -> Result<store::Stats> {
-        let cfg = &self.cfg.store;
+    fn store_worker(&self, k: usize, groups: &[Group], next: &std::sync::atomic::AtomicUsize, progress: &Progress, as_is: bool) -> Result<store::Stats> {
         let mut total = store::Stats::default();
         loop {
             if progress.cancel.load(Ordering::Relaxed) {
@@ -575,36 +653,110 @@ impl Engine {
             }
             let g = next.fetch_add(1, Ordering::Relaxed);
             let Some(group) = groups.get(g) else { break };
-            let (mut conn, refused) = store::Connection::open(cfg, &group.contexts).with_context(|| group.label.clone())?;
-            progress.say(format!("接続 {}: {} を張った({} 個、SOP Class {} 種)", k + 1, group.label, group.count, group.contexts.len()));
-            if !refused.is_empty() {
-                progress.say(format!("接続 {}: 受け側が受けつけない SOP Class(送れない): {}", k + 1, refused.join(", ")));
+            let started = std::time::Instant::now();
+            let set_status = |done: u64| {
+                if let Some(w) = progress.workers.lock().unwrap().get_mut(k) {
+                    *w = WorkerStatus { group: Some(group.label.clone()), done, total: group.count, started: Some(started) };
+                }
+            };
+            set_status(0);
+            let r = self.send_group(k, group, progress, as_is, &set_status);
+            if let Some(w) = progress.workers.lock().unwrap().get_mut(k) {
+                *w = WorkerStatus::default();
             }
-            for (path, place, ixs) in &group.items {
-                let Some(prepared) = self.prepare(path, place, progress)? else { continue };
-                for &ix in ixs {
-                    if progress.cancel.load(Ordering::Relaxed) {
-                        let _ = conn.close();
-                        bail!(CANCELLED);
-                    }
-                    let (sop, ds) = self.make(&prepared, place, ix)?;
-                    if self.writes_files() {
-                        self.write(&ds, &sop, ix, path)?;
-                    }
-                    // ディスクを経由せず、複製したデータセットをそのまま送る
-                    let inst = store::Instance { sop_class: place.sop_class.clone(), sop_instance: sop, object: ds.into_inner() };
-                    match conn.store(&inst)? {
-                        store::Outcome::Sent => {}
-                        store::Outcome::Warned(st) => progress.say(format!("警告つきで受けつけた(status {st:04X}): {}", inst.sop_instance)),
-                        store::Outcome::Rejected(st) => progress.say(format!("受け側が拒否した(status {st:04X}): {}", inst.sop_instance)),
-                        store::Outcome::Unsupported => progress.say(format!("送れない: SOP Class {} を受け側が受けつけない({})", inst.sop_class, inst.sop_instance)),
-                    }
-                    progress.done.fetch_add(1, Ordering::Relaxed);
+            let secs = started.elapsed().as_secs_f64();
+            match r {
+                Ok(st) => {
+                    progress.results.lock().unwrap().push(GroupResult { label: group.label.clone(), count: group.count, sent: st.sent, rejected: st.rejected, secs, error: None });
+                    total += st;
+                }
+                Err(e) => {
+                    progress.results.lock().unwrap().push(GroupResult { label: group.label.clone(), count: group.count, sent: 0, rejected: 0, secs, error: Some(format!("{e:#}")) });
+                    return Err(e);
                 }
             }
-            total += conn.close().with_context(|| group.label.clone())?;
         }
         Ok(total)
+    }
+
+    /// 1 まとまりを、アソシエーションを 1 本張って送り切る。
+    fn send_group(&self, k: usize, group: &Group, progress: &Progress, as_is: bool, set_status: &dyn Fn(u64)) -> Result<store::Stats> {
+        let cfg = &self.cfg.store;
+        progress.wlog(k, format!("A-ASSOCIATE-RQ {} ← {} : {}", cfg.target(), cfg.calling_ae.trim(), group.label));
+        for (sop, ts) in &group.contexts {
+            progress.wlog(k, format!("  提案 {sop} [{}]", ts.join(", ")));
+        }
+        let (mut conn, refused) = match store::Connection::open(cfg, &group.contexts) {
+            Ok(c) => c,
+            Err(e) => {
+                progress.wlog(k, format!("A-ASSOCIATE 失敗: {e:#}"));
+                return Err(e.context(group.label.clone()));
+            }
+        };
+        progress.wlog(k, format!("A-ASSOCIATE-AC 受諾 ({} 個を送る)", group.count));
+        progress.say(format!("接続 {}: {} を張った({} 個、SOP Class {} 種)", k + 1, group.label, group.count, group.contexts.len()));
+        for r in &refused {
+            progress.wlog(k, format!("  拒否された抽象構文 {r}"));
+        }
+        if !refused.is_empty() {
+            progress.say(format!("接続 {}: 受け側が受けつけない SOP Class(送れない): {}", k + 1, refused.join(", ")));
+        }
+        let mut done = 0u64;
+        for (path, place, ixs) in &group.items {
+            // そのまま送るときは、読んだものを書き換えずに送る
+            let prepared = if as_is { None } else { self.prepare(path, place, progress)? };
+            if !as_is && prepared.is_none() {
+                continue;
+            }
+            for &ix in ixs {
+                if progress.cancel.load(Ordering::Relaxed) {
+                    let _ = conn.close();
+                    bail!(CANCELLED);
+                }
+                let (sop, ds) = match &prepared {
+                    Some(p) => self.make(p, place, ix)?,
+                    None => {
+                        let ds = open_file(path).with_context(|| path.display().to_string())?;
+                        let sop = ds.meta().media_storage_sop_instance_uid().trim_end_matches(['\0', ' ']).to_string();
+                        (sop, ds)
+                    }
+                };
+                if !as_is && self.writes_files() {
+                    self.write(&ds, &sop, ix, path)?;
+                }
+                // ディスクを経由せず、データセットをそのまま送る
+                let inst = store::Instance { sop_class: place.sop_class.clone(), sop_instance: sop, object: ds.into_inner() };
+                let short = inst.sop_instance.rsplit('.').next().unwrap_or("").chars().rev().take(10).collect::<String>().chars().rev().collect::<String>();
+                let outcome = match conn.store(&inst) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        progress.wlog(k, format!("C-STORE-RQ …{short} 送信に失敗: {e:#}"));
+                        return Err(e);
+                    }
+                };
+                match outcome {
+                    store::Outcome::Sent => progress.wlog(k, format!("C-STORE-RQ …{short}  → RSP 0000 (成功)")),
+                    store::Outcome::Warned(st) => {
+                        progress.wlog(k, format!("C-STORE-RQ …{short}  → RSP {st:04X} (警告)"));
+                        progress.say(format!("警告つきで受けつけた(status {st:04X}): {}", inst.sop_instance));
+                    }
+                    store::Outcome::Rejected(st) => {
+                        progress.wlog(k, format!("C-STORE-RQ …{short}  → RSP {st:04X} (失敗)"));
+                        progress.say(format!("受け側が拒否した(status {st:04X}): {}", inst.sop_instance));
+                    }
+                    store::Outcome::Unsupported => {
+                        progress.wlog(k, format!("C-STORE-RQ …{short}  送れない: 抽象構文 {} が未受諾", inst.sop_class));
+                        progress.say(format!("送れない: SOP Class {} を受け側が受けつけない({})", inst.sop_class, inst.sop_instance));
+                    }
+                }
+                done += 1;
+                set_status(done);
+                progress.done.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let st = conn.close().with_context(|| group.label.clone())?;
+        progress.wlog(k, format!("A-RELEASE 完了: 成功 {} / 拒否 {}", st.sent, st.rejected));
+        Ok(st)
     }
 
     fn combos(&self) -> Vec<Idx> {

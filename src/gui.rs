@@ -2,8 +2,8 @@
 //! パネルの並びも vw に合わせる: メニュー → 道具の帯 → ログ(下)→ 設定(左)→ 構成とプレビュー(右)→ タグの規則(中央)。
 
 use crate::charset::Charset;
-use crate::config::{self, Config, CsvEncoding, Level, RuleSpec};
-use crate::engine::{self, src_vars_for, tag_of, vars_for, Engine, Idx, PreviewRow, Progress, TableCache, DEFAULT_RULES};
+use crate::config::{self, Config, CsvEncoding, Destination, Level, RuleSpec};
+use crate::engine::{self, src_vars_for, tag_of, vars_for, Engine, GroupResult, Idx, PreviewRow, Progress, TableCache, WorkerStatus, DEFAULT_RULES};
 use crate::tree::{self, Counts, Place, SourceTree};
 use anyhow::Result;
 use dicom_dictionary_std::tags;
@@ -107,6 +107,13 @@ struct SaveDialog {
     name: String,
 }
 
+/// 右のパネルのタブ。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RightTab {
+    Preview,
+    Send,
+}
+
 /// 複製後の木で選んでいる元のノード(患者・検査・シリーズの番号)。
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct Selection {
@@ -142,6 +149,12 @@ struct App {
     /// C-ECHO を裏で試している最中
     echo: Option<Receiver<Result<String, String>>>,
     log: Vec<String>,
+
+    tab: RightTab,
+    /// 送り先の帳簿(presets/destinations.toml)
+    destinations: Vec<Destination>,
+    /// 帳簿に保存するときの名前
+    dest_name: String,
 }
 
 impl App {
@@ -175,7 +188,17 @@ impl App {
             job: None,
             echo: None,
             log: vec!["起動した。元のディレクトリは、窓にフォルダをドロップしても指定できる".into()],
+            tab: RightTab::Preview,
+            destinations: vec![],
+            dest_name: String::new(),
         };
+        match config::load_destinations(&app.preset_dir) {
+            Ok(d) => app.destinations = d,
+            Err(e) => app.log.push(format!("エラー: {e:#}")),
+        }
+        if app.cfg.store.enabled {
+            app.tab = RightTab::Send;
+        }
         app.count_sources(&cc.egui_ctx);
         app
     }
@@ -320,13 +343,23 @@ impl App {
 
     /// 実行の前に分かる問題。実行ボタンを押せなくする理由にもなる。
     fn blocking_problem(&self) -> Option<String> {
-        if self.cfg.input.trim().is_empty() {
-            return Some("元のディレクトリを指定してほしい".into());
+        let as_is = self.cfg.store.enabled && self.cfg.store.as_is;
+        if as_is {
+            if self.cfg.store.as_is_dir.trim().is_empty() {
+                return Some("そのまま送るディレクトリを指定してほしい".into());
+            }
+            if !Path::new(self.cfg.store.as_is_dir.trim()).is_dir() {
+                return Some("そのまま送るディレクトリがない".into());
+            }
+        } else {
+            if self.cfg.input.trim().is_empty() {
+                return Some("元のディレクトリを指定してほしい".into());
+            }
+            if !Path::new(self.cfg.input.trim()).is_dir() {
+                return Some("元のディレクトリがない".into());
+            }
         }
-        if !Path::new(self.cfg.input.trim()).is_dir() {
-            return Some("元のディレクトリがない".into());
-        }
-        if self.writes_files() {
+        if !as_is && self.writes_files() {
             if self.cfg.output.trim().is_empty() {
                 return Some("出力先を指定してほしい".into());
             }
@@ -372,12 +405,16 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let p = progress.clone();
         let ctx = ctx.clone();
+        let as_is = self.cfg.store.enabled && self.cfg.store.as_is;
         std::thread::spawn(move || {
-            let r = engine.run(&p).map_err(|e| format!("{e:#}"));
+            let r = if as_is { engine.run_send_as_is(&p) } else { engine.run(&p) }.map_err(|e| format!("{e:#}"));
             let _ = tx.send(r);
             ctx.request_repaint();
         });
-        self.note("実行を始めた");
+        if self.cfg.store.enabled {
+            self.tab = RightTab::Send;
+        }
+        self.note(if as_is { "そのまま送り始めた" } else { "実行を始めた" });
         self.job = Some(Job { progress, done: rx, logged: 0, started: std::time::Instant::now() });
     }
 
@@ -515,6 +552,15 @@ impl App {
                 }
             });
             vw_ui::menu::bar_menu(ui, "表示", |ui| {
+                if ui.add(vw_ui::menu::item(self.tab == RightTab::Preview, "構成とプレビュー", "")).clicked() {
+                    self.tab = RightTab::Preview;
+                    ui.close();
+                }
+                if ui.add(vw_ui::menu::item(self.tab == RightTab::Send, "送信", "")).clicked() {
+                    self.tab = RightTab::Send;
+                    ui.close();
+                }
+                ui.separator();
                 for (pref, label) in [
                     (ThemePreference::System, "テーマ: システムに合わせる"),
                     (ThemePreference::Dark, "テーマ: ダーク"),
@@ -570,9 +616,14 @@ impl App {
                     let button = egui::Button::new(RichText::new("▶ 水増しを実行").strong());
                     let r = ui.add_enabled(problem.is_none(), button);
                     start = r.clicked();
-                    match (problem, self.total()) {
+                    let total = if self.cfg.store.enabled && self.cfg.store.as_is { Some(0) } else { self.total() };
+                    match (problem, total) {
                         (Some(p), _) => {
                             ui.colored_label(WARN, format!("⚠ {p}"));
+                        }
+                        (None, Some(0)) => {
+                            ui.label("そのまま送る");
+                            ui.weak(format!("{} → C-STORE {}({} 接続、{})", self.cfg.store.as_is_dir.trim(), self.cfg.store.target(), self.cfg.store.connections.max(1), self.cfg.store.unit.label()));
                         }
                         (None, Some(total)) => {
                             let verb = if self.cfg.store.enabled { "送信" } else { "出力" };
@@ -689,48 +740,12 @@ impl App {
             store.enabled = chosen > 0;
             store.also_write = chosen == 2;
             if store.enabled {
-                egui::Grid::new("store").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-                    ui.label("ホスト");
-                    ui.add(egui::TextEdit::singleline(&mut store.host).desired_width(170.0));
-                    ui.end_row();
-                    ui.label("ポート");
-                    ui.add(egui::DragValue::new(&mut store.port).range(1..=65535).speed(1.0));
-                    ui.end_row();
-                    ui.label("相手の AE タイトル");
-                    ui.add(egui::TextEdit::singleline(&mut store.called_ae).desired_width(170.0).char_limit(16));
-                    ui.end_row();
-                    ui.label("自分の AE タイトル");
-                    ui.add(egui::TextEdit::singleline(&mut store.calling_ae).desired_width(170.0).char_limit(16));
-                    ui.end_row();
-                    ui.label("同時の接続数");
-                    ui.add(egui::DragValue::new(&mut store.connections).range(1..=64).speed(0.2));
-                    ui.end_row();
-                    ui.label("アソシエーションの単位");
-                    vw_ui::menu::combo("assoc_unit").selected_text(store.unit.label()).show_ui(ui, |ui| {
-                        for u in config::AssocUnit::ALL {
-                            ui.selectable_value(&mut store.unit, u, u.label());
-                        }
-                    });
-                    ui.end_row();
-                });
                 ui.horizontal(|ui| {
-                    let busy = self.echo.is_some();
-                    if ui.add_enabled(!busy, egui::Button::new("接続を試す(C-ECHO)")).clicked() {
-                        let cfg = self.cfg.store.clone();
-                        let (tx, rx) = mpsc::channel();
-                        let ctx = ctx.clone();
-                        std::thread::spawn(move || {
-                            let r = crate::store::echo(&cfg).map_err(|e| format!("{e:#}"));
-                            let _ = tx.send(r);
-                            ctx.request_repaint();
-                        });
-                        self.echo = Some(rx);
-                    }
-                    if busy {
-                        ui.weak("試している…");
+                    ui.weak(format!("→ {}", store.target()));
+                    if ui.small_button("送信の画面へ").clicked() {
+                        self.tab = RightTab::Send;
                     }
                 });
-                ui.weak("単位ごとにアソシエーションを張り、そのまとまりに要る SOP Class だけを提案して、送り切ったら解放する。私用の SOP Class も、受け側が受ければ送れる");
             }
             if self.writes_files() {
                 ui.add_space(6.0);
@@ -968,8 +983,234 @@ impl App {
 
     // ---- 構成(元 → 複製後)とプレビュー ------------------------------------------------------
 
+    fn right_panel_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            for (tab, label) in [(RightTab::Preview, "構成とプレビュー"), (RightTab::Send, "送信")] {
+                if ui.selectable_label(self.tab == tab, RichText::new(label).strong()).clicked() {
+                    self.tab = tab;
+                }
+            }
+        });
+        ui.separator();
+        match self.tab {
+            RightTab::Preview => self.preview_ui(ui),
+            RightTab::Send => self.send_ui(ui),
+        }
+    }
+
+    // ---- 送信 ----------------------------------------------------------------------------
+
+    fn send_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        egui::ScrollArea::vertical().id_salt("send").auto_shrink(false).show(ui, |ui| {
+            self.send_destination_ui(ui, &ctx);
+            self.send_what_ui(ui);
+            self.send_status_ui(ui);
+            self.send_results_ui(ui);
+        });
+    }
+
+    /// 送り先: 帳簿から選ぶか、入れて保存する。C-ECHO で試せる。
+    fn send_destination_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        Self::section(ui, "送り先");
+        let mut pick: Option<usize> = None;
+        let mut delete: Option<usize> = None;
+        ui.horizontal(|ui| {
+            let current = self
+                .destinations
+                .iter()
+                .position(|d| d.host == self.cfg.store.host && d.port == self.cfg.store.port && d.called_ae == self.cfg.store.called_ae);
+            let text = current.map(|i| self.destinations[i].name.clone()).unwrap_or_else(|| "(帳簿から選ぶ)".into());
+            vw_ui::menu::combo("dest_book").selected_text(text).width(240.0).show_ui(ui, |ui| {
+                if self.destinations.is_empty() {
+                    ui.weak("(まだない。下で入れて保存する)");
+                }
+                for (i, d) in self.destinations.iter().enumerate() {
+                    if ui.selectable_label(current == Some(i), format!("{}  {}@{}:{}", d.name, d.called_ae, d.host, d.port)).clicked() {
+                        pick = Some(i);
+                    }
+                }
+            });
+            if let Some(i) = current {
+                if ui.small_button("帳簿から消す").clicked() {
+                    delete = Some(i);
+                }
+            }
+        });
+        if let Some(i) = pick {
+            let d = self.destinations[i].clone();
+            self.cfg.store.host = d.host;
+            self.cfg.store.port = d.port;
+            self.cfg.store.called_ae = d.called_ae;
+            self.dest_name = d.name;
+        }
+        if let Some(i) = delete {
+            let d = self.destinations.remove(i);
+            match config::save_destinations(&self.preset_dir, &self.destinations) {
+                Ok(()) => self.note(format!("送り先「{}」を帳簿から消した", d.name)),
+                Err(e) => self.note(format!("エラー: {e:#}")),
+            }
+        }
+        let store = &mut self.cfg.store;
+        egui::Grid::new("store").num_columns(4).spacing([8.0, 4.0]).show(ui, |ui| {
+            ui.label("ホスト");
+            ui.add(egui::TextEdit::singleline(&mut store.host).desired_width(150.0));
+            ui.label("ポート");
+            ui.add(egui::DragValue::new(&mut store.port).range(1..=65535).speed(1.0));
+            ui.end_row();
+            ui.label("相手の AE");
+            ui.add(egui::TextEdit::singleline(&mut store.called_ae).desired_width(150.0).char_limit(16));
+            ui.label("自分の AE");
+            ui.add(egui::TextEdit::singleline(&mut store.calling_ae).desired_width(150.0).char_limit(16));
+            ui.end_row();
+        });
+        ui.horizontal(|ui| {
+            ui.label("名前");
+            ui.add(egui::TextEdit::singleline(&mut self.dest_name).desired_width(150.0).hint_text("評価 PACS"));
+            let exists = self.destinations.iter().any(|d| d.name == self.dest_name.trim());
+            let ok = !self.dest_name.trim().is_empty() && !self.cfg.store.host.trim().is_empty();
+            if ui.add_enabled(ok, egui::Button::new(if exists { "帳簿を上書き" } else { "帳簿に保存" })).clicked() {
+                let d = Destination { name: self.dest_name.trim().to_string(), host: self.cfg.store.host.trim().to_string(), port: self.cfg.store.port, called_ae: self.cfg.store.called_ae.trim().to_string() };
+                match self.destinations.iter_mut().find(|x| x.name == d.name) {
+                    Some(x) => *x = d.clone(),
+                    None => self.destinations.push(d.clone()),
+                }
+                match config::save_destinations(&self.preset_dir, &self.destinations) {
+                    Ok(()) => self.note(format!("送り先「{}」を帳簿に保存した", d.name)),
+                    Err(e) => self.note(format!("エラー: {e:#}")),
+                }
+            }
+            let busy = self.echo.is_some();
+            if ui.add_enabled(!busy, egui::Button::new("C-ECHO")).on_hover_text("接続を試す").clicked() {
+                let cfg = self.cfg.store.clone();
+                let (tx, rx) = mpsc::channel();
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let r = crate::store::echo(&cfg).map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(r);
+                    ctx.request_repaint();
+                });
+                self.echo = Some(rx);
+            }
+            if busy {
+                ui.weak("試している…");
+            }
+        });
+    }
+
+    /// 送るもの(水増し / そのまま)と送り方(単位・接続数)。
+    fn send_what_ui(&mut self, ui: &mut egui::Ui) {
+        Self::section(ui, "送るもの");
+        let store = &mut self.cfg.store;
+        let mut as_is = store.as_is;
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut as_is, false, "水増しして送る(設定と規則を使う)");
+            ui.selectable_value(&mut as_is, true, "フォルダの DICOM をそのまま送る");
+        });
+        store.as_is = as_is;
+        if as_is {
+            Self::path_row(ui, "そのまま送るディレクトリ(再帰的に探す)", &mut store.as_is_dir, Self::browse_dir);
+            ui.weak("複製も書き換えもしない。UID も元のまま");
+        } else if !store.enabled {
+            ui.colored_label(WARN, "⚠ 設定の「送り先」が「ファイルに書く」になっている。送るには「C-STORE で送る」にする");
+        } else {
+            ui.weak(if store.also_write { "送って、出力先にも書く" } else { "ディスクには書かない" });
+        }
+        store.enabled |= as_is;
+        egui::Grid::new("send_how").num_columns(4).spacing([8.0, 4.0]).show(ui, |ui| {
+            ui.label("アソシエーションの単位");
+            vw_ui::menu::combo("assoc_unit").selected_text(store.unit.label()).show_ui(ui, |ui| {
+                for u in config::AssocUnit::ALL {
+                    ui.selectable_value(&mut store.unit, u, u.label());
+                }
+            });
+            ui.label("同時の接続数");
+            ui.add(egui::DragValue::new(&mut store.connections).range(1..=64).speed(0.2));
+            ui.end_row();
+        });
+        ui.weak("単位ごとにアソシエーションを 1 本張り、そのまとまりに要る SOP Class だけを提案して、送り切ったら解放する");
+    }
+
+    /// 接続ごとの状態と、端末風のログ。
+    fn send_status_ui(&mut self, ui: &mut egui::Ui) {
+        Self::section(ui, "接続の状態");
+        let Some(job) = &self.job else {
+            ui.weak("実行中の送信はない");
+            return;
+        };
+        let workers: Vec<WorkerStatus> = job.progress.workers.lock().unwrap().clone();
+        let logs: Vec<Vec<String>> = job.progress.worker_logs.lock().unwrap().iter().map(|l| l.iter().rev().take(200).rev().cloned().collect()).collect();
+        let term_bg = ui.visuals().extreme_bg_color;
+        for (k, w) in workers.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("接続 {}", k + 1)).strong());
+                match (&w.group, w.started) {
+                    (Some(g), Some(t)) => {
+                        let secs = t.elapsed().as_secs_f64();
+                        let rate = if secs > 0.2 { format!("{:.0} 個/秒", w.done as f64 / secs) } else { String::new() };
+                        ui.label(g);
+                        ui.add(egui::ProgressBar::new(if w.total == 0 { 0.0 } else { w.done as f32 / w.total as f32 }).desired_width(140.0).text(format!("{} / {}", w.done, w.total)));
+                        ui.weak(rate);
+                    }
+                    _ => {
+                        ui.weak("待機");
+                    }
+                }
+            });
+            egui::Frame::NONE.fill(term_bg).inner_margin(egui::Margin::symmetric(6, 4)).corner_radius(2).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                egui::ScrollArea::vertical().id_salt(("wlog", k)).max_height(96.0).stick_to_bottom(true).auto_shrink([false, true]).show(ui, |ui| {
+                    for line in logs.get(k).map(|l| l.as_slice()).unwrap_or(&[]) {
+                        let text = RichText::new(line).small().monospace();
+                        if line.contains("失敗") || line.contains("拒否") {
+                            ui.colored_label(ERROR, text);
+                        } else {
+                            ui.label(text);
+                        }
+                    }
+                });
+            });
+            ui.add_space(4.0);
+        }
+    }
+
+    /// 送り終えたまとまりの表。
+    fn send_results_ui(&mut self, ui: &mut egui::Ui) {
+        Self::section(ui, "結果(まとまりごと)");
+        let Some(job) = &self.job else {
+            ui.weak("(次の送信の結果がここに出る)");
+            return;
+        };
+        let results: Vec<GroupResult> = job.progress.results.lock().unwrap().clone();
+        if results.is_empty() {
+            ui.weak("(まだない)");
+            return;
+        }
+        egui::Grid::new("results").num_columns(5).striped(true).spacing([12.0, 2.0]).show(ui, |ui| {
+            for h in ["まとまり", "個数", "成功", "拒否", "秒"] {
+                ui.label(RichText::new(h).weak().small());
+            }
+            ui.end_row();
+            for r in &results {
+                ui.label(&r.label);
+                ui.label(r.count.to_string());
+                ui.label(r.sent.to_string());
+                if r.rejected > 0 {
+                    ui.colored_label(ERROR, r.rejected.to_string());
+                } else {
+                    ui.label("0");
+                }
+                ui.label(format!("{:.1}", r.secs));
+                ui.end_row();
+                if let Some(e) = &r.error {
+                    ui.colored_label(ERROR, format!("✗ {e}"));
+                    ui.end_row();
+                }
+            }
+        });
+    }
+
     fn preview_ui(&mut self, ui: &mut egui::Ui) {
-        vw_ui::panel::header(ui, "構成とプレビュー");
         let c = &self.cfg;
         self.sample.p = self.sample.p.min(c.patients.max(1) - 1);
         self.sample.s = self.sample.s.min(c.studies.max(1) - 1);
@@ -1341,7 +1582,7 @@ impl eframe::App for App {
             .show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("log").resizable(true).default_size(140.0).show(ui, |ui| self.log_ui(ui));
         egui::Panel::left("settings").resizable(true).default_size(320.0).show(ui, |ui| self.settings_ui(ui));
-        egui::Panel::right("preview").resizable(true).default_size(520.0).show(ui, |ui| self.preview_ui(ui));
+        egui::Panel::right("preview").resizable(true).default_size(520.0).show(ui, |ui| self.right_panel_ui(ui));
         egui::CentralPanel::default().show(ui, |ui| self.rules_ui(ui));
         self.save_dialog_ui(&ctx);
     }

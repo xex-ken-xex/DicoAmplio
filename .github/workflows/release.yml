@@ -1,17 +1,25 @@
 name: release
 
 # v* のタグを push すると、Linux と Windows の実行ファイルを作って Release に添付する。
-# 手動実行(workflow_dispatch)では Release は作らず、成果物だけを確かめられる。
+# 手動実行(workflow_dispatch)で tag を入れると、その名前のタグと Release を GitHub 上で作る
+# (タグを push できない環境から出すため)。tag が空なら Release は作らず、成果物だけを確かめられる。
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "作る Release のタグ(例 v0.1.0)。空なら成果物だけ"
+        required: false
+        default: ""
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  # タグ push ならその名前、手動なら入力の tag(空なら枝の名前)
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -37,7 +45,7 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          name="dicoamplio-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="dicoamplio-${RELEASE_TAG}-${{ matrix.target }}"
           mkdir -p "dist/$name"
           cp "target/release/${{ matrix.exe }}" README.md "dist/$name/"
           cp -r presets examples "dist/$name/"
@@ -54,7 +62,7 @@ jobs:
           path: dist/*
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag != ''
     needs: build
     runs-on: ubuntu-22.04
     permissions:
@@ -68,5 +76,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" --title "DicoAmplio $GITHUB_REF_NAME" --generate-notes
+          # --target で、タグがまだなければこのコミットに作る
+          gh release create "$RELEASE_TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "DicoAmplio $RELEASE_TAG" --generate-notes

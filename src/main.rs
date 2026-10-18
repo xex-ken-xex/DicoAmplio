@@ -58,6 +58,9 @@ struct Args {
     /// C-ECHO で送り先との接続を試して終わる(--send と一緒に)
     #[arg(long)]
     echo: bool,
+    /// 水増しせず、このディレクトリの DICOM をそのまま送る(--send と一緒に。元のディレクトリは要らない)
+    #[arg(long, value_name = "DIR")]
+    send_only: Option<String>,
     /// 患者の複製数(元を 1 組とした総数)
     #[arg(long)]
     patients: Option<u32>,
@@ -156,6 +159,10 @@ fn build_config(a: &Args, dir: &Path) -> Result<Config> {
     if a.also_write {
         c.store.also_write = true;
     }
+    if let Some(d) = &a.send_only {
+        c.store.as_is = true;
+        c.store.as_is_dir = d.clone();
+    }
     if let Some(f) = &a.rules {
         let text = std::fs::read_to_string(f).with_context(|| format!("規則ファイルを読めない: {}", f.display()))?;
         for l in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
@@ -193,6 +200,15 @@ fn main() -> Result<()> {
             anyhow::bail!("--echo には --send AET@host:port が要る");
         }
         eprintln!("{}", store::echo(&cfg.store)?);
+        return Ok(());
+    }
+    if cfg.store.as_is {
+        if !cfg.store.enabled {
+            anyhow::bail!("--send-only には --send AET@host:port が要る");
+        }
+        let progress = Progress { echo: true, ..Default::default() };
+        let sent = Engine::new(&cfg)?.run_send_as_is(&progress)?;
+        eprintln!("送信 {sent} 個");
         return Ok(());
     }
     let needs_output = !cfg.store.enabled || cfg.store.also_write;

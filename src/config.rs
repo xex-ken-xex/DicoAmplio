@@ -144,6 +144,9 @@ pub struct StoreConfig {
     /// 1 つのアソシエーションで送るまとまり
     pub unit: AssocUnit,
     pub also_write: bool,
+    /// 水増しせず、`as_is_dir` の DICOM をそのまま送る
+    pub as_is: bool,
+    pub as_is_dir: String,
 }
 
 impl Default for StoreConfig {
@@ -157,8 +160,47 @@ impl Default for StoreConfig {
             connections: 4,
             unit: AssocUnit::default(),
             also_write: false,
+            as_is: false,
+            as_is_dir: String::new(),
         }
     }
+}
+
+/// 送り先の帳簿の 1 件。
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Destination {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub called_ae: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct DestinationBook {
+    #[serde(rename = "destination")]
+    destinations: Vec<Destination>,
+}
+
+pub const DESTINATIONS_FILE: &str = "destinations.toml";
+
+/// 帳簿を読む。ファイルがなければ空。
+pub fn load_destinations(dir: &Path) -> Result<Vec<Destination>> {
+    let path = dir.join(DESTINATIONS_FILE);
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let text = std::fs::read_to_string(&path).with_context(|| format!("読めない: {}", path.display()))?;
+    let book: DestinationBook = toml::from_str(&text).with_context(|| format!("送り先の帳簿の書式が違う: {}", path.display()))?;
+    Ok(book.destinations)
+}
+
+pub fn save_destinations(dir: &Path, destinations: &[Destination]) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let book = DestinationBook { destinations: destinations.to_vec() };
+    let path = dir.join(DESTINATIONS_FILE);
+    std::fs::write(&path, toml::to_string_pretty(&book)?).with_context(|| format!("書けない: {}", path.display()))
 }
 
 impl StoreConfig {
@@ -312,6 +354,17 @@ mod tests {
         assert!(preset_path(d, "a/b").is_err());
         assert!(preset_path(d, ".hidden").is_err());
         assert_eq!(preset_path(d, "日本人患者").unwrap(), d.join("日本人患者.toml"));
+    }
+
+    #[test]
+    fn destination_book_roundtrips_and_is_empty_when_missing() {
+        let dir = std::env::temp_dir().join(format!("dicoamplio-dest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(load_destinations(&dir).unwrap().is_empty());
+        let list = vec![Destination { name: "評価 PACS".into(), host: "10.0.0.5".into(), port: 11112, called_ae: "PACS".into() }];
+        save_destinations(&dir, &list).unwrap();
+        assert_eq!(load_destinations(&dir).unwrap(), list);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

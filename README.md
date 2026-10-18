@@ -18,6 +18,8 @@ cargo build --release
 cargo build --release
 ```
 
+配布用の実行ファイルは GitHub の Releases にある(`v*` のタグを push するか、Actions の `release` を手動で実行して `tag` に `v0.1.0` のように入れると、Linux と Windows の実行ファイルを作って Release に添付する)。
+
 できる実行ファイルは `target/release/dicoamplio`(Windows は `target\release\dicoamplio.exe`)。`target/` は `.gitignore` で除いてあるので、リポジトリには入らない。画面なしで作るなら `cargo build --release --no-default-features`(eframe などを入れないので小さい)。
 
 - 件数は元を 1 組としたときの倍数。総数は 元ファイル数 × patients × studies × series × images。
@@ -71,6 +73,9 @@ printf 風で、変数は `%(名前)` で指定する: `EVAL%(p1)05d`、`%(weigh
 - `--connections` 本まで同時に張る(それぞれ別のまとまりを受け持つ)。CT しかないデータで `modality` なら 1 本になるので、並列にしたければ `study` にする。
 - 提案する抽象構文は元ファイルの SOP Class UID そのもの。私用・未知の SOP Class も、受け側が受け入れれば送れる。転送構文は、非圧縮のリトルエンディアンなら明示・暗黙の両方(元の方を先に)、圧縮や Big Endian はそのままの転送構文だけを提案する。
 - 受け側が受けつけない SOP Class のものは「拒否」として数え、最後にエラーにする。接続が切れたら全体を止める。
+- `--send-only DIR` で、水増しも書き換えもせずに DIR の DICOM をそのまま送る(storescu と同じ。単位の分け方は効く)。
+
+画面では右のパネルの「送信」タブ。送り先の帳簿(`presets/destinations.toml` に名前つきで保存。C-ECHO で試せる)、送るもの(水増しして送る / フォルダをそのまま送る)、送り方(単位・接続数)、接続ごとの状態と端末風のログ(`[  12.345] A-ASSOCIATE-RQ …`、C-STORE-RQ ごとの応答、A-RELEASE)、まとまりごとの結果(個数・成功・拒否・秒)。
 
 目安(ループバック、pynetdicom の受け側、4 コア): CT 200 個を 1 本のアソシエーションで 0.9 秒、15 本の検査ごとを 4 接続で 100 個 0.6 秒(起動と元の木の読み込みを含む)。
 
