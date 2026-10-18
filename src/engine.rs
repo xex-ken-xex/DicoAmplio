@@ -1,7 +1,7 @@
 //! 水増し本体。元の各ファイルを 1 回だけ読み込み、(患者, 検査, シリーズ, 画像) の組ごとに
 //! 複製して UID と識別タグを振り直し、rayon で並列に書き出す。
 
-use crate::charset::{decode_iso2022jp, encode_iso2022jp, flavor_of, is_multi_iso2022, raw_bytes_of, scs_values, Charset, Flavor};
+use crate::charset::{is_multi_iso2022, scs_values, Charset, Iso2022};
 use crate::config::{Config, CsvEncoding, Level, RuleSpec};
 use crate::template::{Template, Vars};
 use anyhow::{bail, Context, Result};
@@ -259,6 +259,7 @@ impl Engine {
     /// 元ファイルを読まずに、規則を `ix` の複製に当てた値を見せる。
     pub fn preview(&self, ix: Idx) -> Vec<PreviewRow> {
         let ints = self.ints(ix, 1);
+        let japanese = Iso2022::japanese();
         self.rules
             .iter()
             .map(|r| {
@@ -278,7 +279,7 @@ impl Engine {
                 if let (Ok(v), Some(vr)) = (&value, vr) {
                     warnings.extend(check_value(vr, v));
                     if self.cfg.charset == Charset::Iso2022jp && is_text_vr(vr) && !v.is_ascii() {
-                        match encode_iso2022jp(v, Flavor::Romaji) {
+                        match japanese.encode(v) {
                             Ok(b) => encoded = Some(b),
                             Err(e) => warnings.push(format!("{e:#}")),
                         }
@@ -342,7 +343,7 @@ impl Engine {
     /// 10 万ファイルを書いた途中で、CSV の 58 行目の字が書けないと分かるのでは遅いため。
     /// 元ファイルの文字セットに頼る「触れない」は、元ファイルを読むまで分からないので、ここでは調べない。
     fn preflight(&self) -> Result<()> {
-        let flavor = (self.cfg.charset == Charset::Iso2022jp).then_some(Flavor::Romaji);
+        let flavor = (self.cfg.charset == Charset::Iso2022jp).then(Iso2022::japanese);
         let ints = self.ints(Idx { p: 0, s: 0, r: 0, i: 0 }, 1);
         for rule in &self.rules {
             let Some(vr) = rule.vr else { continue };
@@ -359,7 +360,7 @@ impl Engine {
                     .tpl
                     .render(&Vars { ints, csv: row })
                     .with_context(|| format!("{} {}: {origin}", rule.name, rule.tag))?;
-                check_writable(vr, &text, flavor).with_context(|| format!("{} {}: {origin}: `{text}`", rule.name, rule.tag))?;
+                check_writable(vr, &text, flavor.as_ref()).with_context(|| format!("{} {}: {origin}: `{text}`", rule.name, rule.tag))?;
             }
         }
         Ok(())
@@ -385,10 +386,11 @@ impl Engine {
             .map(|v| scs_values(&v))
             .unwrap_or_default();
         let multi = is_multi_iso2022(&src_scs);
-        // 日本語を自前で符号化するときの、英数字の戻し先
-        let flavor = match c.charset {
-            Charset::Iso2022jp => Some(Flavor::Romaji),
-            Charset::Keep if multi => Some(flavor_of(&src_scs).with_context(|| unsupported_scs(path, &src_scs))?),
+        let spec: Option<Iso2022> = if multi { Iso2022::from_values(&src_scs) } else { None };
+        // 日本語などを自前で符号化するときの文字セットの組
+        let flavor: Option<Iso2022> = match c.charset {
+            Charset::Iso2022jp => Some(Iso2022::japanese()),
+            Charset::Keep if multi => Some(spec.clone().with_context(|| unsupported_scs(path, &src_scs))?),
             _ => None,
         };
         // 触れない(Keep)ときに、新しい値が元ファイルの文字セットで書けるかを調べるための符号化器
@@ -399,8 +401,8 @@ impl Engine {
         // dicom-rs は複数値の ISO 2022 を先頭の値だけで読み、ESC $ B などが文字列に残る。
         // 触れない(Keep)なら、そのバイト列のまま書き戻せば元どおりなので、読み直すのは書き換えるときだけ
         if multi && c.charset != Charset::Keep {
-            flavor_of(&src_scs).with_context(|| unsupported_scs(path, &src_scs))?;
-            decode_source_text(&mut src).with_context(|| format!("元ファイルの日本語を読めない: {}", path.display()))?;
+            let spec = spec.as_ref().with_context(|| unsupported_scs(path, &src_scs))?;
+            decode_source_text(&mut src, spec).with_context(|| format!("元ファイルの文字列を読めない: {}", path.display()))?;
         }
         let src_inst_no: i64 = src
             .get(tags::INSTANCE_NUMBER)
@@ -429,7 +431,8 @@ impl Engine {
             if let Some(code) = c.charset.code() {
                 ds.put_str(tags::SPECIFIC_CHARACTER_SET, VR::CS, code);
             }
-            if let Some(f) = flavor {
+            // 触れない(Keep)の元ファイルの文字列は、dicom-rs が読んだ文字列をそのバイト列に書き戻すだけで元どおり
+            if let (Some(f), Charset::Iso2022jp) = (&flavor, c.charset) {
                 reencode_existing(&mut ds, f).with_context(|| path.display().to_string())?;
             }
             for rule in &self.rules {
@@ -446,7 +449,7 @@ impl Engine {
                 if let Some((code, cs)) = &keep_check {
                     check_keep(vr, &text, code, cs.as_ref()).with_context(|| format!("{} {} ({})", rule.name, rule.tag, path.display()))?;
                 }
-                put_value(&mut ds, rule.tag, vr, &text, flavor)
+                put_value(&mut ds, rule.tag, vr, &text, flavor.as_ref())
                     .with_context(|| format!("{} {} ({})", rule.name, rule.tag, path.display()))?;
             }
 
@@ -498,14 +501,14 @@ impl Engine {
 
 fn unsupported_scs(path: &Path, values: &[String]) -> String {
     format!(
-        "元ファイルの文字セット `{}` は扱えない(先頭が空・ISO 2022 IR 6・ISO 2022 IR 13 の組だけ): {}",
+        "元ファイルの文字セット `{}` は扱えない(先頭が空・IR 6・IR 13・IR 100/101/109/110/126/127/138/144/166 のどれかで、続きが IR 87 かそれらの別のセットの組だけ): {}",
         values.join("\\"),
         path.display()
     )
 }
 
 /// dicom-rs が読んだ複数値の ISO 2022 の文字列を、本来の文字列に直す(シーケンスの中も)。
-fn decode_source_text(obj: &mut InMemDicomObject) -> Result<()> {
+fn decode_source_text(obj: &mut InMemDicomObject, spec: &Iso2022) -> Result<()> {
     let found: Vec<(Tag, VR)> = obj.iter().map(|e| (e.tag(), e.vr())).collect();
     for (tag, vr) in found {
         if vr != VR::SQ && !is_text_vr(vr) {
@@ -515,7 +518,7 @@ fn decode_source_text(obj: &mut InMemDicomObject) -> Result<()> {
         obj.update_value(tag, |v| match v {
             Value::Sequence(seq) => {
                 for item in seq.items_mut() {
-                    if let Err(e) = decode_source_text(item) {
+                    if let Err(e) = decode_source_text(item, spec) {
                         err = Some(e);
                     }
                 }
@@ -524,9 +527,9 @@ fn decode_source_text(obj: &mut InMemDicomObject) -> Result<()> {
                 let decoded: Result<Vec<String>> = p
                     .to_multi_str()
                     .iter()
-                    .map(|t| match raw_bytes_of(t) {
-                        // ESC がなければ、dicom-rs の読みで正しい(ASCII と半角カナだけ)
-                        Some(b) if b.contains(&0x1b) => decode_iso2022jp(&b).with_context(|| format!("{tag}")),
+                    .map(|t| match spec.raw_bytes_of(t) {
+                        // ESC がなければ、dicom-rs が先頭の値で読んだとおりで正しい
+                        Some(b) if b.contains(&0x1b) => spec.decode(&b).with_context(|| format!("{tag}")),
                         _ => Ok(t.clone()),
                     })
                     .collect();
@@ -558,7 +561,7 @@ fn ensure_private_creator(obj: &mut InMemDicomObject, tag: Tag) {
 
 /// 元ファイルにすでにある日本語などの文字列を、ISO 2022 のバイト列に直す。
 /// dicom-rs は複数値の文字セットを切り替えて書けないので、文字セットを替えたぶんは自分で符号化する。
-fn reencode_existing(obj: &mut InMemDicomObject, flavor: Flavor) -> Result<()> {
+fn reencode_existing(obj: &mut InMemDicomObject, flavor: &Iso2022) -> Result<()> {
     let found: Vec<(Tag, VR)> = obj.iter().map(|e| (e.tag(), e.vr())).collect();
     for (tag, vr) in found {
         if vr == VR::SQ {
@@ -583,7 +586,7 @@ fn reencode_existing(obj: &mut InMemDicomObject, flavor: Flavor) -> Result<()> {
                 continue;
             };
             if !text.is_ascii() {
-                let bytes = encode_iso2022jp(&text, flavor).with_context(|| format!("元ファイルの {tag}: `{text}`"))?;
+                let bytes = flavor.encode(&text).with_context(|| format!("元ファイルの {tag}: `{text}`"))?;
                 obj.put(DataElement::new(tag, vr, PrimitiveValue::U8(bytes.into())));
             }
         }
@@ -593,7 +596,7 @@ fn reencode_existing(obj: &mut InMemDicomObject, flavor: Flavor) -> Result<()> {
 
 /// 数値の VR は数として、日本語を ISO 2022 にするときは符号化したバイト列として、
 /// それ以外は文字列として入れる。
-fn put_value(obj: &mut InMemDicomObject, tag: Tag, vr: VR, v: &str, flavor: Option<Flavor>) -> Result<()> {
+fn put_value(obj: &mut InMemDicomObject, tag: Tag, vr: VR, v: &str, flavor: Option<&Iso2022>) -> Result<()> {
     let num = |v: &str| -> Result<f64> { v.trim().parse::<f64>().with_context(|| format!("{tag} は数値が要る: `{v}`")) };
     let el = |value: PrimitiveValue| DataElement::new(tag, vr, value);
     match vr {
@@ -604,7 +607,7 @@ fn put_value(obj: &mut InMemDicomObject, tag: Tag, vr: VR, v: &str, flavor: Opti
         VR::FL => obj.put(el(PrimitiveValue::from(num(v)? as f32))),
         VR::FD => obj.put(el(PrimitiveValue::from(num(v)?))),
         _ if flavor.is_some() && is_text_vr(vr) && !v.is_ascii() => {
-            let bytes = encode_iso2022jp(v, flavor.unwrap()).with_context(|| format!("値 `{v}`"))?;
+            let bytes = flavor.unwrap().encode(v).with_context(|| format!("値 `{v}`"))?;
             obj.put(el(PrimitiveValue::U8(bytes.into())))
         }
         _ => obj.put_str(tag, vr, v),
@@ -719,13 +722,13 @@ fn check_keep(vr: VR, text: &str, code: &str, cs: Option<&SpecificCharacterSet>)
 }
 
 /// 値をその VR で書けるか。数値の VR は数として読めること、日本語を自前で符号化するときは符号化できること。
-fn check_writable(vr: VR, text: &str, flavor: Option<Flavor>) -> Result<()> {
+fn check_writable(vr: VR, text: &str, flavor: Option<&Iso2022>) -> Result<()> {
     if matches!(vr, VR::US | VR::UL | VR::SS | VR::SL | VR::FL | VR::FD) {
         text.trim().parse::<f64>().map(|_| ()).map_err(|_| anyhow::anyhow!("{vr} は数値が要る"))?;
     }
     if let Some(f) = flavor {
         if is_text_vr(vr) && !text.is_ascii() {
-            encode_iso2022jp(text, f)?;
+            f.encode(text)?;
         }
     }
     Ok(())
