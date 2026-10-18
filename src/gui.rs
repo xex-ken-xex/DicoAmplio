@@ -1052,16 +1052,18 @@ impl App {
             }
         }
         let store = &mut self.cfg.store;
-        egui::Grid::new("store").num_columns(4).spacing([8.0, 4.0]).show(ui, |ui| {
+        egui::Grid::new("store").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
             ui.label("ホスト");
-            ui.add(egui::TextEdit::singleline(&mut store.host).desired_width(150.0));
+            ui.add(egui::TextEdit::singleline(&mut store.host).desired_width(240.0));
+            ui.end_row();
             ui.label("ポート");
             ui.add(egui::DragValue::new(&mut store.port).range(1..=65535).speed(1.0));
             ui.end_row();
-            ui.label("相手の AE");
-            ui.add(egui::TextEdit::singleline(&mut store.called_ae).desired_width(150.0).char_limit(16));
-            ui.label("自分の AE");
-            ui.add(egui::TextEdit::singleline(&mut store.calling_ae).desired_width(150.0).char_limit(16));
+            ui.label("相手の AE タイトル");
+            ui.add(egui::TextEdit::singleline(&mut store.called_ae).desired_width(240.0).char_limit(16));
+            ui.end_row();
+            ui.label("自分の AE タイトル");
+            ui.add(egui::TextEdit::singleline(&mut store.calling_ae).desired_width(240.0).char_limit(16));
             ui.end_row();
         });
         ui.horizontal(|ui| {
@@ -1162,7 +1164,9 @@ impl App {
                 egui::ScrollArea::vertical().id_salt(("wlog", k)).max_height(96.0).stick_to_bottom(true).auto_shrink([false, true]).show(ui, |ui| {
                     for line in logs.get(k).map(|l| l.as_slice()).unwrap_or(&[]) {
                         let text = RichText::new(line).small().monospace();
-                        if line.contains("失敗") || line.contains("拒否") {
+                        // 「拒否 0」は失敗ではない
+                        let bad = line.contains("失敗") || (line.contains("拒否") && !line.ends_with("拒否 0"));
+                        if bad {
                             ui.colored_label(ERROR, text);
                         } else {
                             ui.label(text);
