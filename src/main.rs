@@ -9,6 +9,7 @@ mod fonts;
 #[cfg(feature = "gui")]
 mod gui;
 mod template;
+mod tree;
 
 use anyhow::{Context, Result};
 use charset::Charset;

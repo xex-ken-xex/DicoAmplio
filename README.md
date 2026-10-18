@@ -43,16 +43,24 @@ printf 風で、変数は `%(名前)` で指定する: `EVAL%(p1)05d`、`%(weigh
 
 | 変数 | 意味 |
 |---|---|
-| `p s r i` | 患者/検査/シリーズ/画像の番号(0 始まり)。`p1 s1 r1 i1` は 1 始まり |
-| `n` | 通し番号(1 始まり) |
-| `inst` | 元の InstanceNumber + 画像番号 × 10000 |
+| `p s r i` | 複製の番号(0 始まり)。元の各患者/検査/シリーズ/画像を n 倍にした、その何回目か。`p1 s1 r1 i1` は 1 始まり。`i` は元の何枚目かではない |
+| `P S R I` | 元の木での番号(0 始まり)。`P` は元の何人目の患者か、`S` はその患者の何番目の検査か、`R` はその検査の何番目のシリーズか、`I` はそのシリーズの何枚目か(InstanceNumber 順) |
+| `n` | 通し番号(1 始まり)。元の画像 → 患者 → 検査 → シリーズ → 画像の複製の順に振る。全出力で一意 |
+| `inst` | 元の InstanceNumber + 画像の複製番号 × 10000。元の画像どうしの区別はこれが引き受ける |
+| `src_patient_id` `src_patient_name` `src_study_id` `src_study_description` `src_series_number` `src_series_description` `src_modality` | 元ファイルの値(文字列)。`PatientID:patient=%(src_patient_id)s-%(p1)d` のように、元の値を残したまま増やせる |
 | CSV の列名 | CSV の 1 行目の列名がそのまま使える(文字列) |
+
+元の患者が複数いるときは、複製の番号 `p` だけでは別の患者が同じ ID に潰れる。既定の `PatientID` は `EVAL%(P)03d-%(p)04d` で、元の患者(`P`)と複製(`p`)の両方で区別する。書き出しの前に元の木を読む(ヘッダだけ)のはこのため。
 
 ### CSV
 
 `--csv` は全体の CSV。タグごとに別の CSV を読むときは `タグ:レベル@CSVのパス=テンプレート`(プリセットでは `csv` と `csv_encoding`)。そのタグの変数には、そのタグの CSV の列が使える。行数を超えたら先頭へ戻る。
 
 何も指定しないときの既定の規則(`src/engine.rs` の `DEFAULT_RULES`): PatientID・PatientName(患者)、StudyID・AccessionNumber(検査)、SeriesNumber(シリーズ)、InstanceNumber(画像)。
+
+## 読めるファイル
+
+SOP Class は見ない。指定したタグと UID だけを書き換え、それ以外(PixelData を含む)は元のバイト列のまま写す。私用・未知の SOP Class、PixelData のないもの(SR など)、カプセル化された圧縮画像(JPEG など)、Big Endian は、そのまま読み書きできる。Deflated(圧縮データセット)は dicom-rs が読めないので飛ばす(ログに出る)。
 
 ## 日本語(文字コード)
 

@@ -1,14 +1,16 @@
 //! 画面。見た目は vw と同じ `vw-ui`(配色・メニュー・パネル見出し)で、
-//! パネルの並びも vw に合わせる: メニュー → 道具の帯 → ログ(下)→ 設定(左)→ プレビュー(右)→ タグの規則(中央)。
+//! パネルの並びも vw に合わせる: メニュー → 道具の帯 → ログ(下)→ 設定(左)→ 構成とプレビュー(右)→ タグの規則(中央)。
 
 use crate::charset::Charset;
 use crate::config::{self, Config, CsvEncoding, Level, RuleSpec};
-use crate::engine::{tag_of, vars_for, Engine, Idx, PreviewRow, Progress, TableCache, DEFAULT_RULES};
+use crate::engine::{self, src_vars_for, tag_of, vars_for, Engine, Idx, PreviewRow, Progress, TableCache, DEFAULT_RULES};
+use crate::tree::{self, Counts, Place, SourceTree};
 use anyhow::Result;
+use dicom_dictionary_std::tags;
 use eframe::egui::{self, Color32, RichText, ThemePreference};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +35,34 @@ fn level_note(level: Level) -> &'static str {
     }
 }
 
+/// 変数の説明(変数名に乗せたときの吹き出し)。
+fn var_help(name: &str) -> &'static str {
+    match name {
+        "p" => "患者の複製番号(0 始まり)。元の各患者を「患者」の数だけ複製した、その何回目か",
+        "p1" => "患者の複製番号(1 始まり)",
+        "P" => "元の木での患者の番号(0 始まり)。元の患者が複数いるとき、どの患者から複製したかを区別する",
+        "s" => "検査の複製番号(0 始まり)。元の各検査を「患者あたりの検査」の数だけ複製した、その何回目か",
+        "s1" => "検査の複製番号(1 始まり)",
+        "S" => "元の木での検査の番号(その患者の中で 0 始まり)",
+        "r" => "シリーズの複製番号(0 始まり)",
+        "r1" => "シリーズの複製番号(1 始まり)",
+        "R" => "元の木でのシリーズの番号(その検査の中で 0 始まり)",
+        "i" => "画像の複製番号(0 始まり)。元の各画像を「シリーズあたりの画像」の数だけ複製した、その何回目か。元の何枚目かではない",
+        "i1" => "画像の複製番号(1 始まり)",
+        "I" => "元の木での画像の番号(そのシリーズの中で InstanceNumber 順に 0 始まり)",
+        "n" => "通し番号(1 始まり)。元の画像 → 患者 → 検査 → シリーズ → 画像の複製の順に振った、全出力で一意な番号",
+        "inst" => "元の InstanceNumber + 画像の複製番号 × 10000。元の画像どうしの区別はこれが引き受ける",
+        "src_patient_id" => "元ファイルの PatientID",
+        "src_patient_name" => "元ファイルの PatientName",
+        "src_study_id" => "元ファイルの StudyID",
+        "src_study_description" => "元ファイルの StudyDescription",
+        "src_series_number" => "元ファイルの SeriesNumber",
+        "src_series_description" => "元ファイルの SeriesDescription",
+        "src_modality" => "元ファイルの Modality",
+        _ => "CSV の列。タグのレベルの単位で 1 行ずつ進む(行数を超えたら先頭へ戻る)",
+    }
+}
+
 const WARN: Color32 = Color32::from_rgb(0xe0, 0xa0, 0x40);
 const ERROR: Color32 = Color32::from_rgb(0xe0, 0x60, 0x60);
 const OK: Color32 = Color32::from_rgb(0x6a, 0xc0, 0x7a);
@@ -40,9 +70,13 @@ const OK: Color32 = Color32::from_rgb(0x6a, 0xc0, 0x7a);
 /// 規則の行のタグの欄の幅。既定の規則の行とそろえるため、1 か所で決める。
 const TAG_W: f32 = 200.0;
 
+/// 木に出す患者・複製の上限。それより多い分は「…ほか N」にまとめる。
+const TREE_LIMIT: usize = 3;
+const SOURCE_LIMIT: usize = 50;
+
 pub fn run(dir: PathBuf, initial: Option<Config>, preset: Option<String>) -> Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("DicoAmplio").with_inner_size([1360.0, 860.0]).with_min_inner_size([900.0, 600.0]),
+        viewport: egui::ViewportBuilder::default().with_title("DicoAmplio").with_inner_size([1400.0, 900.0]).with_min_inner_size([900.0, 600.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -60,9 +94,25 @@ struct Job {
     started: std::time::Instant,
 }
 
+/// 元データの木を裏で読んでいる最中。
+struct Scan {
+    rx: Receiver<SourceTree>,
+    done: Arc<AtomicU64>,
+    total: usize,
+    cancel: Arc<AtomicBool>,
+}
+
 /// 保存の確認。同じ名前があるときは、もう一度押してもらう。
 struct SaveDialog {
     name: String,
+}
+
+/// 複製後の木で選んでいる元のノード(患者・検査・シリーズの番号)。
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct Selection {
+    patient: usize,
+    study: usize,
+    series: usize,
 }
 
 struct App {
@@ -78,9 +128,13 @@ struct App {
     /// engine を作ったときの設定(入出力先など、engine に関わらない欄は空にしてある)
     engine_cfg: Config,
     table_cache: TableCache,
+    /// 元のディレクトリのファイル数(歩いて数えたもの。木を読む前から分かる)
     sources: Option<usize>,
     counted_input: String,
+    tree: Option<Arc<SourceTree>>,
+    scan: Option<Scan>,
     sample: Idx,
+    selection: Selection,
     /// CSV の欄を開いている規則(cfg.rules の番号)
     csv_open: HashSet<usize>,
 
@@ -111,12 +165,15 @@ impl App {
             theme,
             sources: None,
             counted_input: String::new(),
+            tree: None,
+            scan: None,
             sample: Idx { p: 0, s: 0, r: 0, i: 0 },
+            selection: Selection::default(),
             csv_open: HashSet::new(),
             job: None,
             log: vec!["起動した。元のディレクトリは、窓にフォルダをドロップしても指定できる".into()],
         };
-        app.count_sources();
+        app.count_sources(&cc.egui_ctx);
         app
     }
 
@@ -137,15 +194,59 @@ impl App {
         }
     }
 
-    /// 入力欄を打っている間に歩き回らないよう、確定したときにだけ数える。
-    fn count_sources(&mut self) {
+    /// 入力欄を打っている間に歩き回らないよう、確定したときにだけ数える。数えたら木も裏で読み始める。
+    fn count_sources(&mut self, ctx: &egui::Context) {
         self.counted_input = self.cfg.input.clone();
-        self.sources = self.engine.as_ref().ok().and_then(|e| e.sources().ok()).map(|s| s.len());
+        if let Some(s) = &self.scan {
+            s.cancel.store(true, Ordering::Relaxed);
+        }
+        self.scan = None;
+        self.tree = None;
+        self.selection = Selection::default();
+        let Ok(files) = engine::list_sources(&self.cfg.input) else {
+            self.sources = None;
+            return;
+        };
+        self.sources = Some(files.len());
+        let done = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let (d, c, ctx) = (done.clone(), cancel.clone(), ctx.clone());
+        let total = files.len();
+        std::thread::spawn(move || {
+            let t = tree::scan(&files, &c, &d);
+            if !c.load(Ordering::Relaxed) {
+                let _ = tx.send(t);
+            }
+            ctx.request_repaint();
+        });
+        self.scan = Some(Scan { rx, done, total, cancel });
+    }
+
+    fn poll_scan(&mut self) {
+        let Some(s) = &self.scan else { return };
+        match s.rx.try_recv() {
+            Ok(t) => {
+                if !t.skipped.is_empty() {
+                    self.log.push(format!("元のディレクトリで DICOM として読めなかったファイル {} 個(書き出しでも飛ばす)", t.skipped.len()));
+                }
+                self.tree = Some(Arc::new(t));
+                self.scan = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => self.scan = None,
+        }
     }
 
     fn total(&self) -> Option<u64> {
         let c = &self.cfg;
         self.sources.map(|n| n as u64 * c.patients as u64 * c.studies as u64 * c.series as u64 * c.images as u64)
+    }
+
+    /// 選んでいる元のノード(シリーズ)の位置。木をまだ読めていなければ先頭。
+    fn current_place(&self) -> Place {
+        let s = self.selection;
+        self.tree.as_ref().and_then(|t| t.place_of(s.patient, s.study, s.series)).unwrap_or_default()
     }
 
     fn save_last(&self) {
@@ -154,14 +255,14 @@ impl App {
         }
     }
 
-    fn load_preset(&mut self, name: &str) {
+    fn load_preset(&mut self, name: &str, ctx: &egui::Context) {
         let result = config::preset_path(&self.preset_dir, name).and_then(|p| Config::load(&p));
         match result {
             Ok(c) => {
                 self.cfg = c;
                 self.current_preset = Some(name.to_string());
                 self.refresh_engine();
-                self.count_sources();
+                self.count_sources(ctx);
                 self.note(format!("プリセット「{name}」を読んだ"));
             }
             Err(e) => self.note(format!("エラー: {e:#}")),
@@ -289,7 +390,7 @@ impl App {
         let dir = if p.is_dir() { p } else { p.parent().map(Path::to_path_buf).unwrap_or(p) };
         self.cfg.input = dir.display().to_string();
         self.refresh_engine();
-        self.count_sources();
+        self.count_sources(ctx);
         self.note(format!("元のディレクトリ: {}", dir.display()));
     }
 
@@ -369,6 +470,10 @@ impl App {
                     ui.close();
                 }
                 ui.separator();
+                if ui.add(vw_ui::menu::item(false, "元のディレクトリを読み直す", "")).clicked() {
+                    self.count_sources(&ctx);
+                    ui.close();
+                }
                 if ui.add(vw_ui::menu::item(false, "ログを消す", "")).clicked() {
                     self.log.clear();
                     ui.close();
@@ -389,7 +494,7 @@ impl App {
             });
         });
         if let Some(n) = load {
-            self.load_preset(&n);
+            self.load_preset(&n, &ctx);
         }
         if let Some(n) = delete {
             self.delete_preset(&n);
@@ -498,17 +603,25 @@ impl App {
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
         vw_ui::panel::header(ui, "設定");
+        let ctx = ui.ctx().clone();
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             Self::section(ui, "入出力");
-            let mut recount = Self::path_row(ui, "元のディレクトリ(再帰的に探す)", &mut self.cfg.input, Self::browse_dir);
-            match self.sources {
-                Some(n) => {
+            let recount = Self::path_row(ui, "元のディレクトリ(再帰的に探す)", &mut self.cfg.input, Self::browse_dir);
+            match (self.sources, &self.scan, &self.tree) {
+                (Some(n), Some(s), _) => {
+                    ui.colored_label(OK, format!("✓ ファイル {n} 個。構成を読んでいる… {} / {}", s.done.load(Ordering::Relaxed), s.total));
+                }
+                (Some(n), None, Some(t)) => {
+                    let c = t.counts();
+                    ui.colored_label(OK, format!("✓ ファイル {n} 個: {} 患者 / {} 検査 / {} シリーズ / {} 画像", c.patients, c.studies, c.series, c.images));
+                }
+                (Some(n), None, None) => {
                     ui.colored_label(OK, format!("✓ ファイル {n} 個"));
                 }
-                None if !self.cfg.input.trim().is_empty() => {
+                (None, _, _) if !self.cfg.input.trim().is_empty() => {
                     ui.colored_label(WARN, "⚠ ディレクトリがない");
                 }
-                None => {
+                _ => {
                     ui.weak("フォルダを窓にドロップしても指定できる");
                 }
             }
@@ -517,10 +630,8 @@ impl App {
             ui.weak("出力は 出力先/P患者/S検査/Rシリーズ/SOPInstanceUID.dcm");
             if recount || self.counted_input != self.cfg.input && !ui.memory(|m| m.focused().is_some()) {
                 self.refresh_engine();
-                self.count_sources();
-                recount = false;
+                self.count_sources(&ctx);
             }
-            let _ = recount;
 
             Self::section(ui, "件数(元の 1 組を何倍にするか)");
             egui::Grid::new("counts").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
@@ -583,7 +694,7 @@ impl App {
                     ui.horizontal_wrapped(|ui| {
                         ui.weak("列:");
                         for c in &e.csv_columns {
-                            ui.label(RichText::new(c).monospace());
+                            ui.label(RichText::new(c).monospace()).on_hover_text(var_help(c));
                         }
                     });
                 }
@@ -607,12 +718,15 @@ impl App {
     fn rules_ui(&mut self, ui: &mut egui::Ui) {
         vw_ui::panel::header(ui, "タグの規則");
         ui.add_space(2.0);
-        ui.weak("値は printf 風(EVAL%(p1)05d、%(weight).1f、%(name)-12s)。タグは辞書の名前か (gggg,eeee)。同じタグは下のものが勝つ。");
+        ui.weak("値は printf 風(EVAL%(p1)05d、%(weight).1f、%(name)-12s)。タグは辞書の名前か (gggg,eeee)。同じタグは下のものが勝つ。変数名に乗せると説明が出る。");
         ui.add_space(4.0);
 
         let mut remove = None;
         let mut add: Option<RuleSpec> = None;
         let csv_columns = self.engine.as_ref().ok().map(|e| e.csv_columns.clone()).unwrap_or_default();
+        let sample = self.sample;
+        let place = self.current_place();
+        let serial = self.engine.as_ref().ok().map(|e| e.serial_number(sample, &place)).unwrap_or(1);
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             for level in Level::ALL {
                 let frame = egui::Frame::group(ui.style()).fill(ui.visuals().faint_bg_color).inner_margin(8.0);
@@ -624,8 +738,14 @@ impl App {
                     });
                     ui.horizontal_wrapped(|ui| {
                         ui.weak(RichText::new("変数:").small());
-                        for v in vars_for(level).iter().copied().chain(csv_columns.iter().map(String::as_str)) {
-                            ui.label(RichText::new(v).small().monospace());
+                        let vars = vars_for(level).into_iter().chain(src_vars_for(level)).chain(csv_columns.iter().map(String::as_str));
+                        for v in vars {
+                            let now = sample_value(v, sample, &place, serial);
+                            let hover = match now {
+                                Some(n) => format!("{}\nいま選んでいる複製では {n}", var_help(v)),
+                                None => var_help(v).to_string(),
+                            };
+                            ui.label(RichText::new(v).small().monospace()).on_hover_text(hover);
                         }
                     });
                     ui.add_space(4.0);
@@ -741,37 +861,216 @@ impl App {
         }
     }
 
-    // ---- プレビュー ----------------------------------------------------------------------
+    // ---- 構成(元 → 複製後)とプレビュー ------------------------------------------------------
 
     fn preview_ui(&mut self, ui: &mut egui::Ui) {
-        vw_ui::panel::header(ui, "プレビュー");
+        vw_ui::panel::header(ui, "構成とプレビュー");
         let c = &self.cfg;
         self.sample.p = self.sample.p.min(c.patients.max(1) - 1);
         self.sample.s = self.sample.s.min(c.studies.max(1) - 1);
         self.sample.r = self.sample.r.min(c.series.max(1) - 1);
         self.sample.i = self.sample.i.min(c.images.max(1) - 1);
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            for (label, v, max) in [
-                ("患者", &mut self.sample.p, c.patients),
-                ("検査", &mut self.sample.s, c.studies),
-                ("シリーズ", &mut self.sample.r, c.series),
-                ("画像", &mut self.sample.i, c.images),
-            ] {
-                ui.label(label);
-                ui.add(egui::DragValue::new(v).range(0..=max.max(1) - 1).speed(0.2));
+
+        let tree_h = (ui.available_height() * 0.45).max(160.0);
+        ui.columns(2, |cols| {
+            self.source_tree_ui(&mut cols[0], tree_h);
+            self.planned_tree_ui(&mut cols[1], tree_h);
+        });
+        ui.add_space(4.0);
+        ui.separator();
+        self.values_ui(ui);
+    }
+
+    fn source_tree_ui(&self, ui: &mut egui::Ui, height: f32) {
+        ui.label(RichText::new("元").strong());
+        let Some(t) = &self.tree else {
+            match &self.scan {
+                Some(s) => {
+                    ui.weak(format!("読んでいる… {} / {}", s.done.load(Ordering::Relaxed), s.total));
+                }
+                None => {
+                    ui.weak("元のディレクトリを指定すると、患者 → 検査 → シリーズの構成が出る");
+                }
+            }
+            return;
+        };
+        let c = t.counts();
+        ui.weak(counts_line(c));
+        egui::ScrollArea::vertical().id_salt("src_tree").max_height(height).auto_shrink([false, true]).show(ui, |ui| {
+            for (pi, p) in t.patients.iter().enumerate().take(SOURCE_LIMIT) {
+                let label = format!("患者 {} {}", p.id, p.name);
+                egui::CollapsingHeader::new(label).id_salt(("src_p", pi)).default_open(pi == 0).show(ui, |ui| {
+                    for (si, s) in p.studies.iter().enumerate() {
+                        let label = format!("検査 {} {} {}", s.id, s.date, s.description);
+                        egui::CollapsingHeader::new(label).id_salt(("src_s", pi, si)).default_open(si == 0).show(ui, |ui| {
+                            for r in &s.series {
+                                let inst = r.inst.map(|(lo, hi)| format!(" Inst {lo}〜{hi}")).unwrap_or_default();
+                                ui.label(format!("シリーズ {} {} {} — {} 画像{inst}", r.number, r.modality, r.description, r.images));
+                            }
+                        });
+                    }
+                });
+            }
+            if t.patients.len() > SOURCE_LIMIT {
+                ui.weak(format!("…ほか {} 患者", t.patients.len() - SOURCE_LIMIT));
             }
         });
-        ui.weak("何番目の複製か(0 始まり)。元ファイルは読まず、規則だけを当てた値");
+    }
+
+    /// 複製後の木。ノードを押すと、その複製の番号を「選んでいる複製」にする。
+    fn planned_tree_ui(&mut self, ui: &mut egui::Ui, height: f32) {
+        ui.label(RichText::new("複製後").strong());
+        let (Some(t), Ok(engine)) = (self.tree.clone(), self.engine.clone()) else {
+            if let Err(e) = &self.engine {
+                ui.colored_label(ERROR, format!("✗ {e}"));
+            } else {
+                ui.weak("(元を読んでから)");
+            }
+            return;
+        };
+        let c = &self.cfg;
+        let (np, ns, nr, ni) = (c.patients, c.studies, c.series, c.images);
+        ui.weak(counts_line(t.planned(np, ns, nr, ni)));
+        let mut pick: Option<(Selection, Idx)> = None;
+        let sel = self.selection;
+        let cur = self.sample;
+        let value = |tag, ix: Idx, place: &Place, fallback: &str| -> String {
+            match engine.render_rule(tag, ix, place) {
+                Some(Ok(v)) => v,
+                Some(Err(_)) => "?".into(),
+                None => fallback.to_string(),
+            }
+        };
+        egui::ScrollArea::vertical().id_salt("plan_tree").max_height(height).auto_shrink([false, true]).show(ui, |ui| {
+            for (pi, p) in t.patients.iter().enumerate().take(SOURCE_LIMIT) {
+                let p_place = t.place_of(pi, 0, 0).unwrap_or_default();
+                for pk in 0..np.min(TREE_LIMIT as u32) {
+                    let ix = Idx { p: pk, s: 0, r: 0, i: 0 };
+                    let label = format!("患者 {} {}  (P={pi} p={pk})", value(tags::PATIENT_ID, ix, &p_place, &p.id), value(tags::PATIENT_NAME, ix, &p_place, &p.name));
+                    let selected = sel.patient == pi && cur.p == pk;
+                    let header = egui::CollapsingHeader::new(RichText::new(label).color(if selected { ui.visuals().strong_text_color() } else { ui.visuals().text_color() }))
+                        .id_salt(("plan_p", pi, pk))
+                        .default_open(pi == 0 && pk == 0);
+                    let r = header.show(ui, |ui| {
+                        for (si, s) in p.studies.iter().enumerate() {
+                            let s_place = t.place_of(pi, si, 0).unwrap_or_default();
+                            for sk in 0..ns.min(TREE_LIMIT as u32) {
+                                let ix = Idx { p: pk, s: sk, r: 0, i: 0 };
+                                let label = format!(
+                                    "検査 {} {} {}  (S={si} s={sk})",
+                                    value(tags::STUDY_ID, ix, &s_place, &s.id),
+                                    value(tags::STUDY_DATE, ix, &s_place, &s.date),
+                                    value(tags::STUDY_DESCRIPTION, ix, &s_place, &s.description)
+                                );
+                                let r = egui::CollapsingHeader::new(label).id_salt(("plan_s", pi, pk, si, sk)).default_open(si == 0 && sk == 0).show(ui, |ui| {
+                                    for (ri, ser) in s.series.iter().enumerate() {
+                                        let r_place = t.place_of(pi, si, ri).unwrap_or_default();
+                                        for rk in 0..nr.min(TREE_LIMIT as u32) {
+                                            let ix = Idx { p: pk, s: sk, r: rk, i: cur.i.min(ni - 1) };
+                                            let inst = match (ser.inst, engine.instance_number_is_default()) {
+                                                (Some((lo, hi)), true) => {
+                                                    let k = cur.i as i64 * 10000;
+                                                    format!(" Inst {}〜{}", lo + k, hi + k)
+                                                }
+                                                _ => String::new(),
+                                            };
+                                            let label = format!(
+                                                "シリーズ {} {} {}  (R={ri} r={rk}) — {} 画像 × {ni}{inst}",
+                                                value(tags::SERIES_NUMBER, ix, &r_place, &ser.number),
+                                                value(tags::MODALITY, ix, &r_place, &ser.modality),
+                                                value(tags::SERIES_DESCRIPTION, ix, &r_place, &ser.description),
+                                                ser.images
+                                            );
+                                            let selected = sel == Selection { patient: pi, study: si, series: ri } && cur.p == pk && cur.s == sk && cur.r == rk;
+                                            if ui.selectable_label(selected, label).clicked() {
+                                                pick = Some((Selection { patient: pi, study: si, series: ri }, ix));
+                                            }
+                                        }
+                                        if nr as usize > TREE_LIMIT {
+                                            ui.weak(format!("…ほか {} シリーズ(r={}〜{})", nr as usize - TREE_LIMIT, TREE_LIMIT, nr - 1));
+                                        }
+                                    }
+                                });
+                                if r.header_response.clicked() {
+                                    pick = Some((Selection { patient: pi, study: si, series: 0 }, Idx { p: pk, s: sk, r: 0, i: cur.i }));
+                                }
+                            }
+                            if ns as usize > TREE_LIMIT {
+                                ui.weak(format!("…ほか {} 検査(s={}〜{})", ns as usize - TREE_LIMIT, TREE_LIMIT, ns - 1));
+                            }
+                        }
+                    });
+                    if r.header_response.clicked() {
+                        pick = Some((Selection { patient: pi, study: 0, series: 0 }, Idx { p: pk, s: 0, r: 0, i: cur.i }));
+                    }
+                }
+                if np as usize > TREE_LIMIT {
+                    ui.weak(format!("…ほか {} 患者(p={}〜{})", np as usize - TREE_LIMIT, TREE_LIMIT, np - 1));
+                }
+            }
+            if t.patients.len() > SOURCE_LIMIT {
+                ui.weak(format!("…ほか {} 元の患者", t.patients.len() - SOURCE_LIMIT));
+            }
+        });
+        if let Some((s, ix)) = pick {
+            self.selection = s;
+            self.sample = ix;
+        }
+    }
+
+    /// 選んでいる複製の番号と、そこでの各タグの値。
+    fn values_ui(&mut self, ui: &mut egui::Ui) {
+        let place = self.current_place();
+        let c = &self.cfg;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("選んでいる複製").strong());
+            for (label, v, max) in [
+                ("患者 p", &mut self.sample.p, c.patients),
+                ("検査 s", &mut self.sample.s, c.studies),
+                ("シリーズ r", &mut self.sample.r, c.series),
+                ("画像 i", &mut self.sample.i, c.images),
+            ] {
+                ui.weak(label);
+                ui.add(egui::DragValue::new(v).range(0..=max.max(1) - 1).speed(0.2));
+            }
+            if let Ok(e) = &self.engine {
+                ui.weak(format!("→ 通し番号 n = {}", e.serial_number(self.sample, &place)));
+            }
+        });
+        if let Some(t) = &self.tree {
+            let s = self.selection;
+            if let Some(p) = t.patients.get(s.patient) {
+                let study = p.studies.get(s.study);
+                let series = study.and_then(|st| st.series.get(s.series));
+                ui.weak(format!(
+                    "元: 患者 {} {} (P={}) / 検査 {} (S={}) / シリーズ {} (R={}) の、患者 {} 回目・検査 {} 回目・シリーズ {} 回目の複製",
+                    p.id,
+                    p.name,
+                    s.patient,
+                    study.map(|st| st.id.as_str()).unwrap_or("-"),
+                    s.study,
+                    series.map(|r| r.number.as_str()).unwrap_or("-"),
+                    s.series,
+                    self.sample.p + 1,
+                    self.sample.s + 1,
+                    self.sample.r + 1
+                ));
+            }
+        } else {
+            ui.weak("元ファイルは読まず、規則だけを当てた値");
+        }
         ui.add_space(4.0);
-        let rows: Vec<PreviewRow> = self.engine.as_ref().map(|e| e.preview(self.sample)).unwrap_or_default();
+        let rows: Vec<PreviewRow> = self.engine.as_ref().map(|e| e.preview(self.sample, &place)).unwrap_or_default();
         let field_bg = ui.visuals().extreme_bg_color;
-        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("values").auto_shrink(false).show(ui, |ui| {
             for r in &rows {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(&r.name).strong());
                     ui.weak(RichText::new(format!("{} {}", r.tag, r.vr)).small());
                     ui.weak(RichText::new(format!("{}レベル", r.level.label())).small());
+                    if let Some(line) = r.csv_line {
+                        ui.weak(RichText::new(format!("CSV {line} 行目")).small());
+                    }
                 });
                 egui::Frame::NONE.fill(field_bg).inner_margin(egui::Margin::symmetric(6, 3)).corner_radius(2).show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -862,6 +1161,39 @@ impl App {
     }
 }
 
+fn counts_line(c: Counts) -> String {
+    format!("{} 患者 / {} 検査 / {} シリーズ / {} 画像", c.patients, c.studies, c.series, c.images)
+}
+
+/// 変数の、いま選んでいる複製での値(吹き出し用)。CSV の列なら None。
+fn sample_value(name: &str, ix: Idx, place: &Place, serial: u64) -> Option<String> {
+    let n = match name {
+        "p" => ix.p as i64,
+        "p1" => ix.p as i64 + 1,
+        "P" => place.patient as i64,
+        "s" => ix.s as i64,
+        "s1" => ix.s as i64 + 1,
+        "S" => place.study as i64,
+        "r" => ix.r as i64,
+        "r1" => ix.r as i64 + 1,
+        "R" => place.series as i64,
+        "i" => ix.i as i64,
+        "i1" => ix.i as i64 + 1,
+        "I" => place.image as i64,
+        "n" => serial as i64,
+        "inst" => 1 + ix.i as i64 * 10000,
+        "src_patient_id" => return Some(format!("`{}`", place.patient_id)),
+        "src_patient_name" => return Some(format!("`{}`", place.patient_name)),
+        "src_study_id" => return Some(format!("`{}`", place.study_id)),
+        "src_study_description" => return Some(format!("`{}`", place.study_description)),
+        "src_series_number" => return Some(format!("`{}`", place.series_number)),
+        "src_series_description" => return Some(format!("`{}`", place.series_description)),
+        "src_modality" => return Some(format!("`{}`", place.modality)),
+        _ => return None,
+    };
+    Some(n.to_string())
+}
+
 fn charset_label(cs: Charset) -> &'static str {
     match cs {
         Charset::Utf8 => "UTF-8(ISO_IR 192)",
@@ -886,9 +1218,10 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_job();
+        self.poll_scan();
         self.take_dropped(&ctx);
         self.refresh_engine();
-        if self.job.is_some() {
+        if self.job.is_some() || self.scan.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
@@ -900,9 +1233,9 @@ impl eframe::App for App {
         egui::Panel::top("toolbar")
             .frame(egui::Frame::side_top_panel(ui.style()).fill(chrome).inner_margin(egui::Margin::symmetric(6, 6)))
             .show(ui, |ui| self.toolbar(ui));
-        egui::Panel::bottom("log").resizable(true).default_size(150.0).show(ui, |ui| self.log_ui(ui));
-        egui::Panel::left("settings").resizable(true).default_size(340.0).show(ui, |ui| self.settings_ui(ui));
-        egui::Panel::right("preview").resizable(true).default_size(380.0).show(ui, |ui| self.preview_ui(ui));
+        egui::Panel::bottom("log").resizable(true).default_size(140.0).show(ui, |ui| self.log_ui(ui));
+        egui::Panel::left("settings").resizable(true).default_size(320.0).show(ui, |ui| self.settings_ui(ui));
+        egui::Panel::right("preview").resizable(true).default_size(520.0).show(ui, |ui| self.preview_ui(ui));
         egui::CentralPanel::default().show(ui, |ui| self.rules_ui(ui));
         self.save_dialog_ui(&ctx);
     }

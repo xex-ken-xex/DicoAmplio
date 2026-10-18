@@ -4,6 +4,7 @@
 use crate::charset::{is_multi_iso2022, scs_values, Charset, Iso2022};
 use crate::config::{Config, CsvEncoding, Level, RuleSpec};
 use crate::template::{Template, Vars};
+use crate::tree::{self, Place};
 use anyhow::{bail, Context, Result};
 use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry, VirtualVr};
 use dicom_core::value::Value;
@@ -51,28 +52,51 @@ const UID_TAGS: &[(Tag, UidLevel)] = &[
 ];
 
 /// 何も指定しないときの規則。同じタグを指定すると上書きされる。
+/// 患者の ID には元の患者の番号 `P` も入れる。複製の番号 `p` だけでは、元の患者が複数いるときに
+/// 別の患者が同じ ID に潰れるため。
 pub const DEFAULT_RULES: &[(&str, Level, &str)] = &[
-    ("PatientID", Level::Patient, "EVAL%(p)06d"),
-    ("PatientName", Level::Patient, "EVAL^%(p)06d"),
+    ("PatientID", Level::Patient, "EVAL%(P)03d-%(p)04d"),
+    ("PatientName", Level::Patient, "EVAL^%(P)03d-%(p)04d"),
     ("StudyID", Level::Study, "%(s1)d"),
-    ("AccessionNumber", Level::Study, "ACC%(p)06d%(s)03d"),
+    ("AccessionNumber", Level::Study, "ACC%(P)03d%(p)04d%(s)02d"),
     ("SeriesNumber", Level::Series, "%(r1)d"),
     ("InstanceNumber", Level::Image, "%(inst)d"),
 ];
 
-/// 規則の値に使える整数の変数。
-pub const BUILTIN_VARS: [&str; 10] = ["p", "p1", "s", "s1", "r", "r1", "i", "i1", "n", "inst"];
+/// 規則の値に使える整数の変数。小文字は複製の番号、大文字は元の木での番号。
+pub const BUILTIN_VARS: [&str; 14] = ["p", "p1", "P", "s", "s1", "S", "r", "r1", "R", "i", "i1", "I", "n", "inst"];
+
+/// 元ファイルの値をそのまま使う文字列の変数(レベルの粗い順)。
+pub const SRC_VARS: [&str; 7] = [
+    "src_patient_id",
+    "src_patient_name",
+    "src_study_id",
+    "src_study_description",
+    "src_series_number",
+    "src_series_description",
+    "src_modality",
+];
 
 /// レベルごとに使える整数の変数。細かいレベルの番号は、粗いレベルのタグには使えない。
 pub fn vars_for(level: Level) -> Vec<&'static str> {
     let upto = match level {
+        Level::Patient => 3,
+        Level::Study => 6,
+        Level::Series => 9,
+        Level::Image => 14,
+    };
+    // BUILTIN_VARS は患者 → 検査 → シリーズ → 画像の順に並べてある
+    BUILTIN_VARS[..upto].to_vec()
+}
+
+/// レベルごとに使える、元ファイルの値の変数。
+pub fn src_vars_for(level: Level) -> Vec<&'static str> {
+    let upto = match level {
         Level::Patient => 2,
         Level::Study => 4,
-        Level::Series => 6,
-        Level::Image => 10,
+        Level::Series | Level::Image => 7,
     };
-    // BUILTIN_VARS は p p1 s s1 r r1 i i1 n inst の順に並べてある
-    BUILTIN_VARS[..upto].to_vec()
+    SRC_VARS[..upto].to_vec()
 }
 
 /// DICOM の標準でのタグのレベル(規則のレベルを決める根拠ではなく、食い違いを警告するために使う)。
@@ -128,6 +152,8 @@ struct Rule {
     /// 辞書で決まらないタグで、元ファイルにもないときは None
     vr: Option<VR>,
     tpl: Template,
+    /// テンプレートの元の文字列(既定のままかを画面が見るため)
+    value: String,
     /// このタグが読む CSV(タグごとの指定がなければ全体の CSV)と、1 行を進める単位
     table: Option<Arc<Table>>,
     level: Level,
@@ -183,6 +209,8 @@ pub struct PreviewRow {
     /// 文字コードで符号化したバイト列(日本語を ISO 2022 にしたときだけ)
     pub encoded: Option<Vec<u8>>,
     pub warnings: Vec<String>,
+    /// CSV を使う規則なら、この複製で読む行(列名の行を 1 とした行番号)
+    pub csv_line: Option<usize>,
 }
 
 impl Engine {
@@ -239,47 +267,57 @@ impl Engine {
         format!("{}.{}", self.cfg.uid_root.trim(), Uuid::new_v5(&self.ns, key.as_bytes()).as_u128())
     }
 
-    /// 通し番号(0 始まり)。患者 → 検査 → シリーズ → 画像の順。
-    fn serial(&self, ix: Idx) -> u64 {
+    /// 通し番号(0 始まり)。元の画像の通し番号 → 患者 → 検査 → シリーズ → 画像の複製の順で、全出力で一意。
+    fn serial(&self, ix: Idx, ordinal: u64) -> u64 {
         let c = &self.cfg;
-        ((ix.p as u64 * c.studies as u64 + ix.s as u64) * c.series as u64 + ix.r as u64) * c.images as u64 + ix.i as u64
+        (((ordinal * c.patients as u64 + ix.p as u64) * c.studies as u64 + ix.s as u64) * c.series as u64 + ix.r as u64) * c.images as u64 + ix.i as u64
     }
 
-    fn csv_row<'a>(&self, rule: &'a Rule, ix: Idx) -> Option<&'a Row> {
+    fn csv_row<'a>(&self, rule: &'a Rule, ix: Idx, place: &Place) -> Option<&'a Row> {
         let t = rule.table.as_deref()?;
-        let c = &self.cfg;
-        let k = match rule.level {
-            Level::Patient => ix.p as u64,
-            Level::Study => ix.p as u64 * c.studies as u64 + ix.s as u64,
-            Level::Series => (ix.p as u64 * c.studies as u64 + ix.s as u64) * c.series as u64 + ix.r as u64,
-            Level::Image => self.serial(ix),
-        };
-        Some(&t.rows[(k % t.rows.len() as u64) as usize])
+        Some(&t.rows[self.csv_index(rule, ix, place) % t.rows.len()])
     }
 
-    fn ints(&self, ix: Idx, src_inst_no: i64) -> [(&'static str, i64); 10] {
-        [
+    fn ints(&self, ix: Idx, place: &Place, src_inst_no: i64) -> Vec<(&'static str, i64)> {
+        vec![
             ("p", ix.p as i64),
-            ("s", ix.s as i64),
-            ("r", ix.r as i64),
-            ("i", ix.i as i64),
             ("p1", ix.p as i64 + 1),
+            ("P", place.patient as i64),
+            ("s", ix.s as i64),
             ("s1", ix.s as i64 + 1),
+            ("S", place.study as i64),
+            ("r", ix.r as i64),
             ("r1", ix.r as i64 + 1),
+            ("R", place.series as i64),
+            ("i", ix.i as i64),
             ("i1", ix.i as i64 + 1),
-            ("n", self.serial(ix) as i64 + 1),
+            ("I", place.image as i64),
+            ("n", self.serial(ix, place.ordinal) as i64 + 1),
             ("inst", src_inst_no + ix.i as i64 * 10000),
         ]
     }
 
-    /// 元ファイルを読まずに、規則を `ix` の複製に当てた値を見せる。
-    pub fn preview(&self, ix: Idx) -> Vec<PreviewRow> {
-        let ints = self.ints(ix, 1);
+    fn strs(place: &Place) -> [(&'static str, &str); 7] {
+        [
+            ("src_patient_id", &place.patient_id),
+            ("src_patient_name", &place.patient_name),
+            ("src_study_id", &place.study_id),
+            ("src_study_description", &place.study_description),
+            ("src_series_number", &place.series_number),
+            ("src_series_description", &place.series_description),
+            ("src_modality", &place.modality),
+        ]
+    }
+
+    /// 元ファイルを読まずに、規則を `ix` の複製(元の木では `place`)に当てた値を見せる。
+    pub fn preview(&self, ix: Idx, place: &Place) -> Vec<PreviewRow> {
+        let ints = self.ints(ix, place, 1);
+        let strs = Self::strs(place);
         let japanese = Iso2022::japanese();
         self.rules
             .iter()
             .map(|r| {
-                let vars = Vars { ints, csv: self.csv_row(r, ix) };
+                let vars = Vars { ints: &ints, strs: &strs, csv: self.csv_row(r, ix, place) };
                 let value = r.tpl.render(&vars).map_err(|e| format!("{e:#}"));
                 let vr = r.vr;
                 let mut warnings = Vec::new();
@@ -309,25 +347,59 @@ impl Engine {
                     value,
                     encoded,
                     warnings,
+                    csv_line: self.csv_line(r, ix, place),
                 }
             })
             .collect()
     }
 
     pub fn sources(&self) -> Result<Vec<PathBuf>> {
-        let input = self.cfg.input.trim();
-        if input.is_empty() {
-            bail!("元のディレクトリを指定してほしい");
+        list_sources(&self.cfg.input)
+    }
+
+    /// タグに規則があれば、`ix` の複製(元の木では `place`)での値。なければ None(元ファイルの値のまま)。
+    /// 画面が複製後の木のラベル(患者 ID・名前・検査の説明など)を出すのに使う。
+    pub fn render_rule(&self, tag: Tag, ix: Idx, place: &Place) -> Option<Result<String, String>> {
+        let r = self.rules.iter().find(|r| r.tag == tag)?;
+        let ints = self.ints(ix, place, 1);
+        let strs = Self::strs(place);
+        let vars = Vars { ints: &ints, strs: &strs, csv: self.csv_row(r, ix, place) };
+        Some(r.tpl.render(&vars).map_err(|e| format!("{e:#}")))
+    }
+
+    /// InstanceNumber の規則が既定(`元の番号 + 複製番号 × 10000`)のままか。
+    /// そのときだけ、画面が複製後の画像の番号の範囲を元の範囲から計算できる。
+    pub fn instance_number_is_default(&self) -> bool {
+        self.rules.iter().find(|r| r.tag == tags::INSTANCE_NUMBER).is_some_and(|r| r.value == "%(inst)d")
+    }
+
+    /// 規則が読む CSV の、`ix` の複製で使う行(1 行目の列名を含めた行番号)。
+    fn csv_line(&self, rule: &Rule, ix: Idx, place: &Place) -> Option<usize> {
+        let t = rule.table.as_deref()?;
+        if !rule.tpl.uses_csv(&t.columns) {
+            return None;
         }
-        if !Path::new(input).is_dir() {
-            bail!("元のディレクトリがない: {input}");
-        }
-        Ok(WalkDir::new(input)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file() && !e.file_name().to_string_lossy().eq_ignore_ascii_case("DICOMDIR"))
-            .map(|e| e.into_path())
-            .collect())
+        Some(self.csv_index(rule, ix, place) % t.rows.len() + 2)
+    }
+
+    /// CSV の行の番号(0 始まり、折り返す前)。そのレベルの単位で、隙間なく 1 つずつ進む。
+    /// 元の木での通し番号(患者・検査・シリーズ・画像)を織り込むので、元が違えば必ず別の行になり、
+    /// 同じ元の複製どうしも別の行になる。
+    fn csv_index(&self, rule: &Rule, ix: Idx, place: &Place) -> usize {
+        let c = &self.cfg;
+        let (np, ns, nr) = (c.patients as u64, c.studies as u64, c.series as u64);
+        let k = match rule.level {
+            Level::Patient => place.patient as u64 * np + ix.p as u64,
+            Level::Study => (place.study_ordinal * np + ix.p as u64) * ns + ix.s as u64,
+            Level::Series => ((place.series_ordinal * np + ix.p as u64) * ns + ix.s as u64) * nr + ix.r as u64,
+            Level::Image => self.serial(ix, place.ordinal),
+        };
+        k as usize
+    }
+
+    /// 通し番号(1 始まり)。画面の表示用。
+    pub fn serial_number(&self, ix: Idx, place: &Place) -> u64 {
+        self.serial(ix, place.ordinal) + 1
     }
 
     pub fn planned(&self, sources: usize) -> u64 {
@@ -342,9 +414,27 @@ impl Engine {
         }
         self.preflight()?;
         let files = self.sources()?;
-        progress.total.store(self.planned(files.len()), Ordering::Relaxed);
-        progress.say(format!("元ファイル {} 個 → 出力 {} 個", files.len(), progress.total.load(Ordering::Relaxed)));
-        let result: Result<Vec<u64>> = files.par_iter().map(|f| self.process(f, progress)).collect();
+        // 元の木を先に読む。元の患者の番号などを規則の変数にするため
+        let tree = tree::scan(&files, &AtomicBool::new(false), &AtomicU64::new(0));
+        let c = tree.counts();
+        progress.total.store(self.planned(tree.files), Ordering::Relaxed);
+        progress.say(format!(
+            "元: {} 患者 / {} 検査 / {} シリーズ / {} 画像({} ファイル) → 出力 {} 個",
+            c.patients,
+            c.studies,
+            c.series,
+            c.images,
+            tree.files,
+            progress.total.load(Ordering::Relaxed)
+        ));
+        for s in &tree.skipped {
+            progress.say(format!("飛ばした: {s}"));
+        }
+        let result: Result<Vec<u64>> = files
+            .par_iter()
+            .filter_map(|f| tree.places.get(f).map(|place| (f, place)))
+            .map(|(f, place)| self.process(f, place, progress))
+            .collect();
         match result {
             Ok(v) => Ok(v.iter().sum()),
             Err(e) if e.to_string() == CANCELLED => {
@@ -360,7 +450,9 @@ impl Engine {
     /// 元ファイルの文字セットに頼る「触れない」は、元ファイルを読むまで分からないので、ここでは調べない。
     fn preflight(&self) -> Result<()> {
         let flavor = (self.cfg.charset == Charset::Iso2022jp).then(Iso2022::japanese);
-        let ints = self.ints(Idx { p: 0, s: 0, r: 0, i: 0 }, 1);
+        let place = Place::default();
+        let ints = self.ints(Idx { p: 0, s: 0, r: 0, i: 0 }, &place, 1);
+        let strs = Self::strs(&place);
         for rule in &self.rules {
             let Some(vr) = rule.vr else { continue };
             let rows: Vec<Option<&Row>> = match &rule.table {
@@ -374,7 +466,7 @@ impl Engine {
                 };
                 let text = rule
                     .tpl
-                    .render(&Vars { ints, csv: row })
+                    .render(&Vars { ints: &ints, strs: &strs, csv: row })
                     .with_context(|| format!("{} {}: {origin}", rule.name, rule.tag))?;
                 check_writable(vr, &text, flavor.as_ref()).with_context(|| format!("{} {}: {origin}: `{text}`", rule.name, rule.tag))?;
             }
@@ -382,9 +474,9 @@ impl Engine {
         Ok(())
     }
 
-    fn process(&self, path: &Path, progress: &Progress) -> Result<u64> {
+    fn process(&self, path: &Path, place: &Place, progress: &Progress) -> Result<u64> {
         let c = &self.cfg;
-        // DICOM でないファイルは飛ばす
+        // 木を読めたファイルだけが来るが、念のため読めなければ飛ばす
         let mut src = match open_file(path) {
             Ok(s) => s,
             Err(e) => {
@@ -455,9 +547,10 @@ impl Engine {
             if let Some(code) = c.charset.code() {
                 ds.put_str(tags::SPECIFIC_CHARACTER_SET, VR::CS, code);
             }
-            let ints = self.ints(ix, src_inst_no);
+            let ints = self.ints(ix, place, src_inst_no);
+            let strs = Self::strs(place);
             for rule in &self.rules {
-                let vars = Vars { ints, csv: self.csv_row(rule, ix) };
+                let vars = Vars { ints: &ints, strs: &strs, csv: self.csv_row(rule, ix, place) };
                 let text = rule.tpl.render(&vars).with_context(|| format!("{} ({})", rule.tag, path.display()))?;
                 // 元ファイルにある要素はその VR を、なければ辞書か規則の VR を使う。暗黙 VR のファイルでは
                 // 辞書にないタグが UN で読まれるので、UN は「決まっていない」として扱う
@@ -665,25 +758,43 @@ fn parse_rule(spec: &RuleSpec, table: Option<Arc<Table>>) -> Result<Rule> {
     let name = entry.map(|e| e.alias().to_string()).unwrap_or_else(|| tag.to_string());
     let level = spec.level;
     let tpl = Template::parse(&spec.value).with_context(|| key.to_string())?;
-    let allowed = vars_for(level);
+    let allowed: Vec<&str> = vars_for(level).into_iter().chain(src_vars_for(level)).collect();
     for n in tpl.names() {
         let in_csv = csv_cols.iter().any(|c| c == n);
-        if in_csv && BUILTIN_VARS.contains(&n) {
+        let builtin = BUILTIN_VARS.contains(&n) || SRC_VARS.contains(&n);
+        if in_csv && builtin {
             // 書式によって組み込みの番号と CSV の列のどちらが勝つかが変わり、レベルの検査もすり抜ける
             bail!("{key}: CSV の列名 `{n}` は組み込みの変数と同じで、どちらを指すか決まらない。CSV の列名を変えてほしい");
         }
         if in_csv {
             continue;
         }
-        if BUILTIN_VARS.contains(&n) && !allowed.contains(&n) {
+        if builtin && !allowed.contains(&n) {
             // 患者のタグが画像番号で変わると、同じ患者の画像で値がばらつく
             bail!("{key} は{}レベルのタグなので、変数 `{n}` は使えない(使える変数: {})", level.label(), allowed.join(" "));
         }
-        if !BUILTIN_VARS.contains(&n) {
+        if !builtin {
             bail!("{key}: 変数 `{n}` がない(CSV の列名か {})", allowed.join(" "));
         }
     }
-    Ok(Rule { tag, name, vr, tpl, table, level })
+    Ok(Rule { tag, name, vr, tpl, value: spec.value.clone(), table, level })
+}
+
+/// 元のディレクトリにあるファイル(再帰。DICOMDIR は除く)。
+pub fn list_sources(input: &str) -> Result<Vec<PathBuf>> {
+    let input = input.trim();
+    if input.is_empty() {
+        bail!("元のディレクトリを指定してほしい");
+    }
+    if !Path::new(input).is_dir() {
+        bail!("元のディレクトリがない: {input}");
+    }
+    Ok(WalkDir::new(input)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file() && !e.file_name().to_string_lossy().eq_ignore_ascii_case("DICOMDIR"))
+        .map(|e| e.into_path())
+        .collect())
 }
 
 fn cached_table(cache: &mut TableCache, path: &str, enc: CsvEncoding) -> Result<Arc<Table>> {
@@ -846,9 +957,37 @@ mod tests {
         let cfg = Config { patients: 3, studies: 2, series: 1, images: 1, ..Config::default() };
         let rule = |level| parse_rule(&RuleSpec::new("StudyDescription", level, "%(v)s"), Some(table.clone())).unwrap();
         let eng = Engine::new(&cfg).unwrap();
-        let at = |r: &Rule, p, s| eng.csv_row(r, Idx { p, s, r: 0, i: 0 }).unwrap()["v"].clone();
+        let at = |r: &Rule, p, s| eng.csv_row(r, Idx { p, s, r: 0, i: 0 }, &Place::default()).unwrap()["v"].clone();
         assert_eq!((at(&rule(Level::Patient), 2, 1), at(&rule(Level::Patient), 2, 0)), ("2".into(), "2".into()));
         assert_eq!((at(&rule(Level::Study), 2, 1), at(&rule(Level::Study), 0, 1)), ("5".into(), "1".into()));
+        // 元の 2 人目の患者は、1 人目の複製と別の行を読む
+        let second = Place { patient: 1, ..Place::default() };
+        let at2 = |p| eng.csv_row(&rule(Level::Patient), Idx { p, s: 0, r: 0, i: 0 }, &second).unwrap()["v"].clone();
+        assert_eq!((at2(0), at2(2)), ("3".into(), "5".into()));
+    }
+
+    #[test]
+    fn source_patients_are_told_apart_by_the_default_rules() {
+        let eng = Engine::new(&Config::default()).unwrap();
+        let ix = Idx { p: 0, s: 0, r: 0, i: 0 };
+        let first = Place::default();
+        let second = Place { patient: 1, ordinal: 7, ..Place::default() };
+        assert_eq!(eng.render_rule(tags::PATIENT_ID, ix, &first).unwrap().unwrap(), "EVAL000-0000");
+        assert_eq!(eng.render_rule(tags::PATIENT_ID, ix, &second).unwrap().unwrap(), "EVAL001-0000");
+        assert_eq!((eng.serial_number(ix, &first), eng.serial_number(ix, &second)), (1, 8));
+    }
+
+    #[test]
+    fn source_values_are_available_as_string_variables() {
+        let place = Place { patient_id: "1001".into(), modality: "CT".into(), ..Place::default() };
+        let rule = parse_rule(&RuleSpec::new("PatientID", Level::Patient, "%(src_patient_id)s-%(p1)d"), None).unwrap();
+        let eng = Engine::new(&Config::default()).unwrap();
+        let ints = eng.ints(Idx { p: 1, s: 0, r: 0, i: 0 }, &place, 1);
+        let strs = Engine::strs(&place);
+        assert_eq!(rule.tpl.render(&Vars { ints: &ints, strs: &strs, csv: None }).unwrap(), "1001-2");
+        // シリーズの値は患者レベルでは使えない
+        let err = parse_rule(&RuleSpec::new("PatientID", Level::Patient, "%(src_modality)s"), None).err().unwrap().to_string();
+        assert!(err.contains("患者レベル"), "{err}");
     }
 
     #[test]
@@ -866,6 +1005,21 @@ mod tests {
         assert!(check_keep(VR::PN, "Mueller", "ISO_IR 6", cs.as_ref()).is_ok());
         let latin = SpecificCharacterSet::from_code("ISO_IR 100");
         assert!(check_keep(VR::PN, "Müller", "ISO_IR 100", latin.as_ref()).is_ok());
+    }
+
+    #[test]
+    fn csv_line_numbers_count_the_header_and_wrap_around() {
+        let table = Arc::new(Table {
+            columns: vec!["v".into()],
+            rows: (0..3).map(|k| [("v".to_string(), k.to_string())].into()).collect(),
+        });
+        let cfg = Config { patients: 5, ..Config::default() };
+        let eng = Engine::new(&cfg).unwrap();
+        let rule = parse_rule(&RuleSpec::new("PatientName", Level::Patient, "%(v)s"), Some(table.clone())).unwrap();
+        let line = |p| eng.csv_line(&rule, Idx { p, s: 0, r: 0, i: 0 }, &Place::default());
+        assert_eq!((line(0), line(2), line(3)), (Some(2), Some(4), Some(2)));
+        let no_csv = parse_rule(&RuleSpec::new("PatientID", Level::Patient, "%(p)d"), Some(table)).unwrap();
+        assert_eq!(eng.csv_line(&no_csv, Idx { p: 0, s: 0, r: 0, i: 0 }, &Place::default()), None);
     }
 
     #[test]

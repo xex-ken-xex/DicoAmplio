@@ -26,9 +26,11 @@ pub struct Template {
     pieces: Vec<Piece>,
 }
 
-/// 実行時の値。整数の変数と、CSV の文字列の列。
+/// 実行時の値。整数の変数、文字列の変数(元ファイルの値など)、CSV の列。
+/// 名前が重なったときは、整数 → 文字列の変数 → CSV の順に見る。
 pub struct Vars<'a> {
-    pub ints: [(&'static str, i64); 10],
+    pub ints: &'a [(&'static str, i64)],
+    pub strs: &'a [(&'static str, &'a str)],
     pub csv: Option<&'a HashMap<String, String>>,
 }
 
@@ -116,7 +118,12 @@ impl Template {
                 Piece::Lit(s) => out.push_str(s),
                 Piece::Spec { name, left, zero, plus, width, prec, conv } => {
                     let int = v.ints.iter().find(|(n, _)| n == name).map(|(_, x)| *x);
-                    let text = v.csv.and_then(|m| m.get(name));
+                    let text: Option<&str> = v
+                        .strs
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, t)| *t)
+                        .or_else(|| v.csv.and_then(|m| m.get(name)).map(String::as_str));
                     let body = match conv {
                         'd' | 'x' | 'X' => {
                             let n = match (int, text) {
@@ -147,7 +154,7 @@ impl Template {
                         }
                         _ => {
                             let mut s = match (int, text) {
-                                (_, Some(t)) => t.clone(),
+                                (_, Some(t)) => t.to_string(),
                                 (Some(n), None) => n.to_string(),
                                 _ => bail!("変数 `{name}` がない"),
                             };
@@ -195,7 +202,8 @@ mod tests {
 
     fn vars(csv: Option<&HashMap<String, String>>) -> Vars<'_> {
         Vars {
-            ints: [("p", 12), ("s", 0), ("r", 1), ("i", 3), ("p1", 13), ("s1", 1), ("r1", 2), ("i1", 4), ("n", 99), ("inst", 7)],
+            ints: &[("p", 12), ("s", 0), ("r", 1), ("i", 3), ("p1", 13), ("s1", 1), ("r1", 2), ("i1", 4), ("n", 99), ("inst", 7)],
+            strs: &[("src_patient_id", "ORIG-7")],
             csv,
         }
     }
@@ -212,6 +220,12 @@ mod tests {
             [("name", "Yamada^Taro"), ("weight", "62.46")].map(|(a, b)| (a.into(), b.into())).into();
         let t = Template::parse("%(name)s|%(weight).1f|%(weight)8.2f|%(name)-12s|").unwrap();
         assert_eq!(t.render(&vars(Some(&m))).unwrap(), "Yamada^Taro|62.5|   62.46|Yamada^Taro |");
+    }
+
+    #[test]
+    fn string_variables_render_like_csv_columns() {
+        let t = Template::parse("%(src_patient_id)s-%(p1)d|%(src_patient_id).4s|").unwrap();
+        assert_eq!(t.render(&vars(None)).unwrap(), "ORIG-7-13|ORIG|");
     }
 
     #[test]
