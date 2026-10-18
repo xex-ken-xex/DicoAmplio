@@ -97,3 +97,7 @@ CSV の文字コードは `--csv-encoding`(`auto` は UTF-8 → だめなら Shi
 - DICOMDIR は作り直さない
 - 元ファイルの文字セットが `ISO 2022 IR 87` 単独の場合は、ASCII を含む文字列の符号化が規格であいまいなので検証していない。IR 148(トルコ語)・IR 149(韓国語)・IR 159 を含む複数値は扱えない
 - プリセットを GUI で上書きするときの確認がない
+
+## ライセンス
+
+MIT または Apache-2.0(vw と同じ)。`LICENSE-MIT`、`LICENSE-APACHE` を参照。

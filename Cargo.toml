@@ -1,6 +1,8 @@
 [package]
 name = "dicoamplio"
 description = "DICOM のタグを書き換えて、評価用に患者・検査・シリーズ・画像を水増しする"
+license = "MIT OR Apache-2.0"
+authors = ["xex (xex-ken-xex)"]
 version = "0.1.0"
 edition = "2021"
 
