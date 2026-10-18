@@ -11,6 +11,7 @@ gui = ["dep:eframe", "dep:vw-ui", "dep:rfd"]
 [dependencies]
 dicom-core = "0.8"
 dicom-dictionary-std = "0.8"
+dicom-encoding = "0.8"
 dicom-object = "0.8"
 clap = { version = "4", features = ["derive"] }
 rayon = "1"

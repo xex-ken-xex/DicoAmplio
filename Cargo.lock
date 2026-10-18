@@ -758,6 +758,7 @@ dependencies = [
  "csv",
  "dicom-core",
  "dicom-dictionary-std",
+ "dicom-encoding",
  "dicom-object",
  "eframe",
  "encoding_rs",

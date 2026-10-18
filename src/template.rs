@@ -96,6 +96,11 @@ impl Template {
         Ok(Template { pieces })
     }
 
+    /// CSV の列を使っているか(整数の変数だけなら、CSV の行を変えても値は変わらない)。
+    pub fn uses_csv(&self, columns: &[String]) -> bool {
+        self.names().any(|n| columns.iter().any(|c| c == n))
+    }
+
     /// 使っている変数名(起動時の検査用)。
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.pieces.iter().filter_map(|p| match p {

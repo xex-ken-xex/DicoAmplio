@@ -12,13 +12,21 @@ cargo build --release
   --set 'PatientWeight:patient=%(weight).1f' --set 'StudyDescription:study=CT %(s1)02d回目'
 ```
 
+## ビルド
+
+```
+cargo build --release
+```
+
+できる実行ファイルは `target/release/dicoamplio`(Windows は `target\release\dicoamplio.exe`)。`target/` は `.gitignore` で除いてあるので、リポジトリには入らない。画面なしで作るなら `cargo build --release --no-default-features`(eframe などを入れないので小さい)。
+
 - 件数は元を 1 組としたときの倍数。総数は 元ファイル数 × patients × studies × series × images。
 - UID(Study/Series/SOP/FrameOfReference と、シーケンス内の参照)は、元の UID と複製の番号から決定的に作り直す。参照は同じ複製の中で張り替わる。
 - 出力は `P患者/S検査/Rシリーズ/SOPInstanceUID.dcm`。
 
 ## タグの規則
 
-`タグ:レベル=テンプレート`(タグは `PatientName` か `(0010,0010)`)。`--set` を繰り返すか、`--rules` のファイルに 1 行ずつ書く(`#` は注釈)。同じタグは後のものが勝つ。画面では、レベルごとの 4 つの節に分かれている。
+`タグ:レベル=テンプレート`。タグは辞書の名前(`PatientName`)か、`(gggg,eeee)` で直接。辞書にないタグ(プライベートなど)は VR を添えて `(0029,1010)/LO:study=…` と書く(プライベートの持ち主の要素 `(0029,0010)` は元ファイルになければ自動で足す)。`--set` を繰り返すか、`--rules` のファイルに 1 行ずつ書く(`#` は注釈)。同じタグは後のものが勝つ。画面では、レベルごとの 4 つの節に分かれている。
 
 ### レベル(必須)
 
@@ -58,6 +66,18 @@ printf 風で、変数は `%(名前)` で指定する: `EVAL%(p1)05d`、`%(weigh
 
 PN は成分グループを `=` でつなぐ(字形=表意=表音)。例: `PatientName=%(name_alpha)s=%(name_kanji)s=%(name_kana)s`
 
+### 元ファイルの文字セット
+
+元ファイルがすでに持っている日本語も、出力の文字コードに合わせて読み直す。
+
+- dicom-rs は複数値の ISO 2022(`ISO 2022 IR 13\ISO 2022 IR 87` など)を先頭の値だけで読み、`ESC $ B` が文字列に残る。そのまま UTF-8 で書くと文字化けするため、自前のデコーダで読み直してから書く。
+- `keep` で元が複数値の ISO 2022 のときは、元の文字セットに合わせて新しい値を符号化する(先頭が `ISO 2022 IR 13` なら `ESC ( J`、空か `ISO 2022 IR 6` なら `ESC ( B` で戻す)。先頭が Latin などの組は扱えない。
+- `keep` で、元の文字セットで書けない値(ASCII の元ファイルに日本語、`ISO_IR 13` に漢字など)は、書く前にエラーで止める。
+- JIS X 0208 にない字(「髙」「﨑」「①」など)は、ISO 2022 では書けない。CSV の全行を、書き出す前に調べて、どの行のどの字かをエラーにする。例: `PatientName (0010,0010): CSV の 4 行目(列: name_kanji name_alpha): ... JIS X 0208 で表せない文字: `髙` (U+9AD9)`。UTF-8 なら書ける。
+- 書き込みに失敗しても、途中で切れたファイルを出力に残さない。
+
+`scripts/verify_charset.py`(要 pydicom)は、元ファイルの文字セット 5 種 × 出力 3 種を、pydicom で読み戻して一致を確かめる。
+
 CSV の文字コードは `--csv-encoding`(`auto` は UTF-8 → だめなら Shift_JIS。Excel の「CSV」も読める)。
 
 ## プリセット
@@ -71,6 +91,6 @@ CSV の文字コードは `--csv-encoding`(`auto` は UTF-8 → だめなら Shi
 ## TODO(未完了・未確認)
 
 - Windows の実機と、GUI の「参照」ダイアログ(rfd)は動作を確認していない(Linux の Xvfb で表示と実行のみ確認)
-- プライベートタグは規則に書けない(辞書にある名前か `(gggg,eeee)` の標準タグだけ)。DICOMDIR は作り直さない
-- 元ファイルが ISO 2022 以外の複数値の文字セットで日本語を持つ場合の再符号化は未検証
+- DICOMDIR は作り直さない
+- 元ファイルの文字セットが、先頭が Latin などの複数値(`ISO 2022 IR 100\ISO 2022 IR 87` など)の場合は読めない(エラーで止まる)。`ISO 2022 IR 87` 単独は、ASCII を含む文字列の符号化が規格であいまいなので検証していない
 - プリセットを GUI で上書きするときの確認がない
