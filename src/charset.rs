@@ -164,7 +164,9 @@ impl Iso2022 {
     }
 
     /// 文字列を ISO 2022 のバイト列にする(末尾は偶数長に空白で埋める)。
-    /// 区切り(`=` `\`)と改行の前、値の終わりで、初期状態(G0 は英数字、G1 は先頭の値のもの)に戻す。
+    /// 区切り(PN の `^` `=`、値の `\`)と制御文字(CR LF FF TAB)の前、値の終わりで、
+    /// 初期状態(G0 は英数字、G1 は先頭の値のもの)に戻す(PS3.5 6.1.2.5.3)。
+    /// pydicom は G1 を戻さずに `^` を書くが、戻しておけば厳密な読み手も寛容な読み手も同じに読める。
     pub fn encode(&self, s: &str) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(s.len() * 2);
         let mut kanji = false;
@@ -181,7 +183,7 @@ impl Iso2022 {
                     out.extend_from_slice(&self.g0_reset);
                     kanji = false;
                 }
-                if matches!(ch, '=' | '\\' | '\n' | '\r' | '\x0c') {
+                if matches!(ch, '^' | '=' | '\\') || ch.is_ascii_control() {
                     reset_g1(&mut out, &mut g1);
                 }
                 out.push(ch as u8);
@@ -396,14 +398,19 @@ mod tests {
     }
 
     #[test]
-    fn g1_is_returned_to_the_first_set_before_a_name_group_delimiter() {
+    fn g1_is_returned_to_the_first_set_before_every_delimiter() {
         let s = spec("ISO 2022 IR 100\\ISO 2022 IR 144");
-        let b = s.encode("Иван=Müller").unwrap();
         let cyrillic = [0x1b, b'-', b'L'];
         let latin = [0x1b, b'-', b'A'];
-        assert_eq!(b[..3], cyrillic);
-        let eq = b.iter().position(|&x| x == b'=').unwrap();
-        assert_eq!(b[eq - 3..eq], latin, "`=` の前に先頭の G1(IR 100)へ戻す");
+        for delim in ['=', '^', '\\', '\t', '\n'] {
+            let b = s.encode(&format!("Иван{delim}Müller")).unwrap();
+            assert_eq!(b[..3], cyrillic);
+            let at = b.iter().position(|&x| x == delim as u8).unwrap();
+            assert_eq!(b[at - 3..at], latin, "{delim:?} の前に先頭の G1(IR 100)へ戻す");
+        }
+        // 戻したあとの Latin は、同じセットなので割り当てを繰り返さない
+        let b = s.encode("Иван^Müller").unwrap();
+        assert_eq!(b.windows(3).filter(|w| *w == latin).count(), 1);
     }
 
     #[test]

@@ -172,7 +172,9 @@ fn main() -> Result<()> {
 #[cfg(feature = "gui")]
 fn open_gui(args: Args, dir: PathBuf) -> Result<()> {
     let initial = build_config(&args, &dir).ok().filter(|_| args.preset.is_some() || args.input.is_some());
-    gui::run(dir, initial)
+    // 名前で指定したプリセットだけを「いま使っているプリセット」として見せる(パスで指定したものは名前がない)
+    let preset = args.preset.clone().filter(|p| !p.ends_with(".toml") && !p.contains(['/', '\\']));
+    gui::run(dir, initial, preset)
 }
 
 #[cfg(not(feature = "gui"))]

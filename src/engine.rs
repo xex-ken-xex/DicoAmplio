@@ -22,10 +22,14 @@ use walkdir::WalkDir;
 
 type Row = HashMap<String, String>;
 
-struct Table {
+pub struct Table {
     columns: Vec<String>,
     rows: Vec<Row>,
 }
+
+/// 読んだ CSV の置き場。画面は設定を変えるたびに Engine を作り直すので、CSV を読み直さずに済むよう
+/// 画面が持ち、更新日時が変わったときだけ読み直す。
+pub type TableCache = HashMap<(String, CsvEncoding), (Option<std::time::SystemTime>, Arc<Table>)>;
 
 #[derive(Clone, Copy)]
 enum UidLevel {
@@ -183,10 +187,22 @@ pub struct PreviewRow {
 
 impl Engine {
     pub fn new(cfg: &Config) -> Result<Engine> {
+        Engine::with_cache(cfg, &mut TableCache::new())
+    }
+
+    pub fn with_cache(cfg: &Config, cache: &mut TableCache) -> Result<Engine> {
+        if [cfg.patients, cfg.studies, cfg.series, cfg.images].contains(&0) {
+            bail!("患者・検査・シリーズ・画像の数は 1 以上にしてほしい");
+        }
         let mut tables = HashMap::new();
+        let mut table = |path: &str, enc: CsvEncoding| -> Result<Arc<Table>> {
+            let t = cached_table(cache, path, enc)?;
+            tables.insert((path.to_string(), enc), t.clone());
+            Ok(t)
+        };
         let global = match cfg.csv.trim() {
             "" => None,
-            path => Some(cached_table(&mut tables, path, cfg.csv_encoding)?),
+            path => Some(table(path, cfg.csv_encoding)?),
         };
 
         // 既定 → 設定の順に積み、同じタグは後のものが勝つ
@@ -199,7 +215,7 @@ impl Engine {
         for s in &specs {
             let own = match s.csv.trim() {
                 "" => None,
-                path => Some(cached_table(&mut tables, path, s.csv_encoding.unwrap_or(cfg.csv_encoding)).with_context(|| s.tag.clone())?),
+                path => Some(table(path, s.csv_encoding.unwrap_or(cfg.csv_encoding)).with_context(|| s.tag.clone())?),
             };
             let r = parse_rule(s, own.or_else(|| global.clone()))?;
             rules.retain(|x| x.tag != r.tag);
@@ -404,6 +420,14 @@ impl Engine {
             let spec = spec.as_ref().with_context(|| unsupported_scs(path, &src_scs))?;
             decode_source_text(&mut src, spec).with_context(|| format!("元ファイルの文字列を読めない: {}", path.display()))?;
         }
+        // 複製ごとに同じ結果になる書き換えは、複製する前に元に対して 1 回だけ行う。
+        // 触れない(Keep)の元ファイルの文字列は、dicom-rs が読んだ文字列をそのバイト列に書き戻すだけで元どおり
+        if let (Some(f), Charset::Iso2022jp) = (&flavor, c.charset) {
+            reencode_existing(&mut src, f).with_context(|| path.display().to_string())?;
+        }
+        for rule in &self.rules {
+            ensure_private_creator(&mut src, rule.tag);
+        }
         let src_inst_no: i64 = src
             .get(tags::INSTANCE_NUMBER)
             .and_then(|e| e.to_str().ok())
@@ -431,20 +455,15 @@ impl Engine {
             if let Some(code) = c.charset.code() {
                 ds.put_str(tags::SPECIFIC_CHARACTER_SET, VR::CS, code);
             }
-            // 触れない(Keep)の元ファイルの文字列は、dicom-rs が読んだ文字列をそのバイト列に書き戻すだけで元どおり
-            if let (Some(f), Charset::Iso2022jp) = (&flavor, c.charset) {
-                reencode_existing(&mut ds, f).with_context(|| path.display().to_string())?;
-            }
-            for rule in &self.rules {
-                ensure_private_creator(&mut ds, rule.tag);
-            }
             let ints = self.ints(ix, src_inst_no);
             for rule in &self.rules {
                 let vars = Vars { ints, csv: self.csv_row(rule, ix) };
                 let text = rule.tpl.render(&vars).with_context(|| format!("{} ({})", rule.tag, path.display()))?;
-                // 元ファイルにある要素はその VR を、なければ辞書の VR を使う
-                let Some(vr) = ds.get(rule.tag).map(|e| e.vr()).or(rule.vr) else {
-                    bail!("{} の VR が決まらない", rule.tag)
+                // 元ファイルにある要素はその VR を、なければ辞書か規則の VR を使う。暗黙 VR のファイルでは
+                // 辞書にないタグが UN で読まれるので、UN は「決まっていない」として扱う
+                let source_vr = ds.get(rule.tag).map(|e| e.vr()).filter(|v| *v != VR::UN);
+                let Some(vr) = source_vr.or(rule.vr) else {
+                    bail!("{} の VR が決まらない(元ファイルでは UN)。規則に /LO のように VR を添えてほしい", rule.tag)
                 };
                 if let Some((code, cs)) = &keep_check {
                     check_keep(vr, &text, code, cs.as_ref()).with_context(|| format!("{} {} ({})", rule.name, rule.tag, path.display()))?;
@@ -645,10 +664,15 @@ fn parse_rule(spec: &RuleSpec, table: Option<Arc<Table>>) -> Result<Rule> {
     }
     let name = entry.map(|e| e.alias().to_string()).unwrap_or_else(|| tag.to_string());
     let level = spec.level;
-    let tpl = Template::parse(&spec.value).with_context(|| format!("{key}"))?;
+    let tpl = Template::parse(&spec.value).with_context(|| key.to_string())?;
     let allowed = vars_for(level);
     for n in tpl.names() {
-        if csv_cols.iter().any(|c| c == n) {
+        let in_csv = csv_cols.iter().any(|c| c == n);
+        if in_csv && BUILTIN_VARS.contains(&n) {
+            // 書式によって組み込みの番号と CSV の列のどちらが勝つかが変わり、レベルの検査もすり抜ける
+            bail!("{key}: CSV の列名 `{n}` は組み込みの変数と同じで、どちらを指すか決まらない。CSV の列名を変えてほしい");
+        }
+        if in_csv {
             continue;
         }
         if BUILTIN_VARS.contains(&n) && !allowed.contains(&n) {
@@ -662,15 +686,25 @@ fn parse_rule(spec: &RuleSpec, table: Option<Arc<Table>>) -> Result<Rule> {
     Ok(Rule { tag, name, vr, tpl, table, level })
 }
 
-fn cached_table(cache: &mut HashMap<(String, CsvEncoding), Arc<Table>>, path: &str, enc: CsvEncoding) -> Result<Arc<Table>> {
+fn cached_table(cache: &mut TableCache, path: &str, enc: CsvEncoding) -> Result<Arc<Table>> {
     let key = (path.to_string(), enc);
-    if let Some(t) = cache.get(&key) {
-        return Ok(t.clone());
+    let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    if let Some((cached_mtime, t)) = cache.get(&key) {
+        if mtime.is_some() && *cached_mtime == mtime {
+            return Ok(t.clone());
+        }
     }
     let (columns, rows) = load_csv(Path::new(path), enc)?;
     let t = Arc::new(Table { columns, rows });
-    cache.insert(key, t.clone());
+    cache.insert(key, (mtime, t.clone()));
     Ok(t)
+}
+
+/// 規則のタグの書き方(`PatientName`、`(0010,0010)`、`(0029,1010)/LO`)からタグだけを取り出す。
+/// 画面が、既定の規則が上書きされたかを、書き方の違いによらず判定するために使う。
+pub fn tag_of(key: &str) -> Option<Tag> {
+    let key = key.trim().split('/').next()?.trim();
+    StandardDataDictionary.by_expr(key).map(|e| e.tag()).or_else(|| key.parse::<Tag>().ok())
 }
 
 fn load_csv(path: &Path, enc: CsvEncoding) -> Result<(Vec<String>, Vec<Row>)> {
@@ -705,6 +739,12 @@ fn check_keep(vr: VR, text: &str, code: &str, cs: Option<&SpecificCharacterSet>)
         return Ok(());
     }
     let hint = "文字コードを utf8 か iso2022jp にすると書ける";
+    let first_non_ascii = text.chars().find(|c| !c.is_ascii()).unwrap_or('?');
+    // 指定なし(ISO_IR 6)は ASCII だけ。dicom-rs の既定の符号化器は ISO 8859-1 で ü などを通してしまうが、
+    // 文字セットの指定がないファイルに 0x80 以上を書くのは規格にない
+    if code == "ISO_IR 6" {
+        bail!("元ファイルには文字セットの指定がなく(ASCII)、`{first_non_ascii}` (U+{:04X}) は書けない。{hint}", first_non_ascii as u32);
+    }
     // ISO_IR 13 は JIS X 0201(半角カナまで)。dicom-rs の符号化器は Shift_JIS なので漢字も通してしまうが、規格にない
     if code == "ISO_IR 13" {
         if let Some(c) = text.chars().find(|c| !c.is_ascii() && !('\u{FF61}'..='\u{FF9F}').contains(c)) {
@@ -809,6 +849,37 @@ mod tests {
         let at = |r: &Rule, p, s| eng.csv_row(r, Idx { p, s, r: 0, i: 0 }).unwrap()["v"].clone();
         assert_eq!((at(&rule(Level::Patient), 2, 1), at(&rule(Level::Patient), 2, 0)), ("2".into(), "2".into()));
         assert_eq!((at(&rule(Level::Study), 2, 1), at(&rule(Level::Study), 0, 1)), ("5".into(), "1".into()));
+    }
+
+    #[test]
+    fn a_csv_column_named_like_a_builtin_variable_is_rejected() {
+        let table = Arc::new(Table { columns: vec!["n".into()], rows: vec![[("n".to_string(), "x".to_string())].into()] });
+        let err = parse_rule(&RuleSpec::new("PatientID", Level::Patient, "%(n)d"), Some(table)).err().unwrap().to_string();
+        assert!(err.contains("列名") && err.contains('n'), "{err}");
+    }
+
+    #[test]
+    fn keep_rejects_non_ascii_when_the_source_declares_no_character_set() {
+        let cs = SpecificCharacterSet::from_code("ISO_IR 6");
+        let err = check_keep(VR::PN, "Müller", "ISO_IR 6", cs.as_ref()).unwrap_err().to_string();
+        assert!(err.contains("ASCII") && err.contains('ü'), "{err}");
+        assert!(check_keep(VR::PN, "Mueller", "ISO_IR 6", cs.as_ref()).is_ok());
+        let latin = SpecificCharacterSet::from_code("ISO_IR 100");
+        assert!(check_keep(VR::PN, "Müller", "ISO_IR 100", latin.as_ref()).is_ok());
+    }
+
+    #[test]
+    fn a_zero_count_is_refused_before_anything_runs() {
+        let err = Engine::new(&Config { patients: 0, ..Config::default() }).err().unwrap().to_string();
+        assert!(err.contains("1 以上"), "{err}");
+    }
+
+    #[test]
+    fn tag_of_accepts_every_spelling_of_a_rule_tag() {
+        assert_eq!(tag_of("PatientName"), Some(tags::PATIENT_NAME));
+        assert_eq!(tag_of("(0010,0010)"), Some(tags::PATIENT_NAME));
+        assert_eq!(tag_of("(0029,1010)/LO"), Some(Tag(0x0029, 0x1010)));
+        assert_eq!(tag_of("NoSuchTag"), None);
     }
 
     #[test]
