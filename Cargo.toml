@@ -1,0 +1,38 @@
+[package]
+name = "dicoamplio"
+description = "DICOM のタグを書き換えて、評価用に患者・検査・シリーズ・画像を水増しする"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:vw-ui", "dep:rfd"]
+
+[dependencies]
+dicom-core = "0.8"
+dicom-dictionary-std = "0.8"
+dicom-object = "0.8"
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+walkdir = "2"
+uuid = { version = "1", features = ["v5"] }
+anyhow = "1"
+csv = "1"
+encoding_rs = "0.8"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+# vw と同じ見た目（配色・メニュー・パネル見出し）を共有する。コピーせず rev で固定するのは、
+# vw 側の見た目の修正を rev を上げるだけで取り込めるようにするため。
+vw-ui = { git = "https://github.com/xex-ken-xex/vw", rev = "7220d326c273494b3443bc4fc790e1d1de5846e8", optional = true }
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"], optional = true }
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"], optional = true }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# vw と同じ winit の写し。Windows で拡大率の違うモニタ間をドラッグするとウインドウが
+# ちらつく不具合を直してある（vw の vendor/winit/README-vw.md）。
+[patch.crates-io]
+winit = { git = "https://github.com/xex-ken-xex/vw", rev = "7220d326c273494b3443bc4fc790e1d1de5846e8" }

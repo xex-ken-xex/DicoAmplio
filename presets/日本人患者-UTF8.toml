@@ -1,0 +1,33 @@
+# 日本語の患者名(字形=表意=表音)を UTF-8 で書く例(UTF-8)。CSV は examples/people_ja.csv。
+patients = 10
+studies = 2
+series = 1
+images = 1
+charset = "utf8"
+csv = "examples/people_ja.csv"
+csv_encoding = "auto"
+
+[[rule]]
+tag = "PatientName"
+level = "patient"
+value = "%(name_alpha)s=%(name_kanji)s=%(name_kana)s"
+
+[[rule]]
+tag = "PatientSex"
+level = "patient"
+value = "%(sex)s"
+
+[[rule]]
+tag = "PatientWeight"
+level = "patient"
+value = "%(weight).1f"
+
+[[rule]]
+tag = "PatientSize"
+level = "patient"
+value = "%(height_cm).1f"
+
+[[rule]]
+tag = "StudyDescription"
+level = "study"
+value = "頭部CT %(s1)02d回目"

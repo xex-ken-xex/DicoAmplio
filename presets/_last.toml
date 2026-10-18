@@ -1,0 +1,35 @@
+input = "/tmp/claude-0/-home-user-UrbsLabyrinthi/30c9b66a-326a-53a4-b91e-18835f659e3b/scratchpad/src"
+output = "/tmp/claude-0/-home-user-UrbsLabyrinthi/30c9b66a-326a-53a4-b91e-18835f659e3b/scratchpad/gui_out"
+patients = 10
+studies = 2
+series = 1
+images = 1
+charset = "iso2022jp"
+uid_root = "2.25"
+csv = "examples/people_ja.csv"
+csv_encoding = "auto"
+
+[[rule]]
+tag = "PatientName"
+level = "patient"
+value = "%(name_alpha)s=%(name_kanji)s=%(name_kana)s"
+
+[[rule]]
+tag = "PatientSex"
+level = "patient"
+value = "%(sex)s"
+
+[[rule]]
+tag = "PatientWeight"
+level = "patient"
+value = "%(weight).1f"
+
+[[rule]]
+tag = "PatientSize"
+level = "patient"
+value = "%(height_cm).1f"
+
+[[rule]]
+tag = "StudyDescription"
+level = "study"
+value = "頭部CT %(s1)02d回目"
