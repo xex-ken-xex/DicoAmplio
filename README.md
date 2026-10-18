@@ -58,6 +58,22 @@ printf 風で、変数は `%(名前)` で指定する: `EVAL%(p1)05d`、`%(weigh
 
 何も指定しないときの既定の規則(`src/engine.rs` の `DEFAULT_RULES`): PatientID・PatientName(患者)、StudyID・AccessionNumber(検査)、SeriesNumber(シリーズ)、InstanceNumber(画像)。
 
+## C-STORE で送る
+
+```
+./target/release/dicoamplio 元のディレクトリ --send PACS@10.0.0.5:11112 --patients 100 \
+  --assoc-unit modality --connections 4 --calling-ae DICOAMPLIO
+./target/release/dicoamplio --send PACS@10.0.0.5:11112 --echo     # C-ECHO で接続を試す
+```
+
+- `--send` を指定すると、複製をディスクに書かず、メモリから直接送る(`--also-write` で両方)。出力先は省略できる。
+- **アソシエーションの単位**(`--assoc-unit`、画面では「送り先」の欄): `modality`(既定)/ `study` / `series` / `patient` / `all`。単位ごとにアソシエーションを 1 本張り、そのまとまりに要る SOP Class だけを提案して、送り切ったら解放する。実機の装置は検査(モダリティ)の単位で送るので、混ぜて送ると PACS 側で取り違えが起きやすいため。`all` は接続の数に均等に割る。
+- `--connections` 本まで同時に張る(それぞれ別のまとまりを受け持つ)。CT しかないデータで `modality` なら 1 本になるので、並列にしたければ `study` にする。
+- 提案する抽象構文は元ファイルの SOP Class UID そのもの。私用・未知の SOP Class も、受け側が受け入れれば送れる。転送構文は、非圧縮のリトルエンディアンなら明示・暗黙の両方(元の方を先に)、圧縮や Big Endian はそのままの転送構文だけを提案する。
+- 受け側が受けつけない SOP Class のものは「拒否」として数え、最後にエラーにする。接続が切れたら全体を止める。
+
+目安(ループバック、pynetdicom の受け側、4 コア): CT 200 個を 1 本のアソシエーションで 0.9 秒、15 本の検査ごとを 4 接続で 100 個 0.6 秒(起動と元の木の読み込みを含む)。
+
 ## 読めるファイル
 
 SOP Class は見ない。指定したタグと UID だけを書き換え、それ以外(PixelData を含む)は元のバイト列のまま写す。私用・未知の SOP Class、PixelData のないもの(SR など)、カプセル化された圧縮画像(JPEG など)、Big Endian は、そのまま読み書きできる。Deflated(圧縮データセット)は dicom-rs が読めないので飛ばす(ログに出る)。

@@ -3,6 +3,7 @@
 
 use crate::charset::{is_multi_iso2022, scs_values, Charset, Iso2022};
 use crate::config::{Config, CsvEncoding, Level, RuleSpec};
+use crate::store;
 use crate::template::{Template, Vars};
 use crate::tree::{self, Place};
 use anyhow::{bail, Context, Result};
@@ -157,6 +158,27 @@ struct Rule {
     /// このタグが読む CSV(タグごとの指定がなければ全体の CSV)と、1 行を進める単位
     table: Option<Arc<Table>>,
     level: Level,
+}
+
+/// 読んで、複製ごとに同じ結果になる書き換えを済ませた元ファイル。
+struct Prepared {
+    src: dicom_object::DefaultDicomObject,
+    /// 日本語などを自前で符号化するときの文字セットの組
+    flavor: Option<Iso2022>,
+    /// 触れない(Keep)ときに、新しい値が元ファイルの文字セットで書けるかを調べるための符号化器
+    keep_check: Option<(String, Option<SpecificCharacterSet>)>,
+    src_inst_no: i64,
+    path: PathBuf,
+}
+
+/// 1 つのアソシエーションで送るまとまり。
+struct Group {
+    label: String,
+    /// 提案する (SOP Class UID, 転送構文の候補)
+    contexts: Vec<(String, Vec<String>)>,
+    /// (元ファイル, 木での位置, 送る複製の番号)
+    items: Vec<(PathBuf, Place, Vec<Idx>)>,
+    count: u64,
 }
 
 /// 複製の番号。UID はこれと元の UID から決定的に作る。
@@ -407,33 +429,42 @@ impl Engine {
         sources as u64 * c.patients as u64 * c.studies as u64 * c.series as u64 * c.images as u64
     }
 
-    /// 書き出した数を返す。中断したときも、そこまでの数を返す。
+    /// ディスクに書くか(送るだけのときは書かない)。
+    fn writes_files(&self) -> bool {
+        !self.cfg.store.enabled || self.cfg.store.also_write
+    }
+
+    /// 書き出した(送った)数を返す。中断したときも、そこまでの数を返す。
     pub fn run(&self, progress: &Progress) -> Result<u64> {
-        if self.cfg.output.trim().is_empty() {
+        if self.writes_files() && self.cfg.output.trim().is_empty() {
             bail!("出力先を指定してほしい");
         }
         self.preflight()?;
         let files = self.sources()?;
-        // 元の木を先に読む。元の患者の番号などを規則の変数にするため
+        // 元の木を先に読む。元の患者の番号などを規則の変数にし、送信では提示コンテキストを集めるため
         let tree = tree::scan(&files, &AtomicBool::new(false), &AtomicU64::new(0));
         let c = tree.counts();
         progress.total.store(self.planned(tree.files), Ordering::Relaxed);
         progress.say(format!(
-            "元: {} 患者 / {} 検査 / {} シリーズ / {} 画像({} ファイル) → 出力 {} 個",
+            "元: {} 患者 / {} 検査 / {} シリーズ / {} 画像({} ファイル) → {} {} 個",
             c.patients,
             c.studies,
             c.series,
             c.images,
             tree.files,
+            if self.cfg.store.enabled { "送信" } else { "出力" },
             progress.total.load(Ordering::Relaxed)
         ));
         for s in &tree.skipped {
             progress.say(format!("飛ばした: {s}"));
         }
+        if self.cfg.store.enabled {
+            return self.run_store(&tree, &files, progress);
+        }
         let result: Result<Vec<u64>> = files
             .par_iter()
             .filter_map(|f| tree.places.get(f).map(|place| (f, place)))
-            .map(|(f, place)| self.process(f, place, progress))
+            .map(|(f, place)| self.process_file(f, place, progress))
             .collect();
         match result {
             Ok(v) => Ok(v.iter().sum()),
@@ -443,6 +474,166 @@ impl Engine {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// 1 つのアソシエーションで送るまとまり。
+    fn groups(&self, tree: &tree::SourceTree, files: &[PathBuf]) -> Vec<Group> {
+        use crate::config::AssocUnit;
+        let c = &self.cfg;
+        let n = c.store.connections.max(1) as u64;
+        let mut listed: Vec<(&PathBuf, &Place)> = files.iter().filter_map(|f| tree.places.get(f).map(|p| (f, p))).collect();
+        listed.sort_by_key(|(_, p)| p.ordinal);
+        let mut map: std::collections::BTreeMap<String, Group> = std::collections::BTreeMap::new();
+        for (f, place) in listed {
+            let mut per_key: std::collections::BTreeMap<String, Vec<Idx>> = std::collections::BTreeMap::new();
+            for ix in self.combos() {
+                let key = match c.store.unit {
+                    AssocUnit::Modality => format!("モダリティ {}", if place.modality.is_empty() { "(なし)" } else { &place.modality }),
+                    AssocUnit::Patient => format!("患者 P{} p{}", place.patient, ix.p),
+                    AssocUnit::Study => format!("検査 P{} p{} S{} s{}", place.patient, ix.p, place.study, ix.s),
+                    AssocUnit::Series => format!("シリーズ P{} p{} S{} s{} R{} r{}", place.patient, ix.p, place.study, ix.s, place.series, ix.r),
+                    AssocUnit::All => format!("組 {}", self.serial(ix, place.ordinal) % n + 1),
+                };
+                per_key.entry(key).or_default().push(ix);
+            }
+            for (key, ixs) in per_key {
+                let g = map.entry(key.clone()).or_insert_with(|| Group { label: key, contexts: vec![], items: vec![], count: 0 });
+                let ctx = (place.sop_class.clone(), store::proposable(&place.transfer_syntax));
+                if !g.contexts.contains(&ctx) {
+                    g.contexts.push(ctx);
+                }
+                g.count += ixs.len() as u64;
+                g.items.push((f.clone(), place.clone(), ixs));
+            }
+        }
+        map.into_values().collect()
+    }
+
+    /// C-STORE で送る。接続の数だけスレッドを立て、各スレッドがグループを 1 つずつ受け持って、
+    /// アソシエーションを張り、複製を作りながら送り、送り切ったら解放する。
+    fn run_store(&self, tree: &tree::SourceTree, files: &[PathBuf], progress: &Progress) -> Result<u64> {
+        let groups = self.groups(tree, files);
+        let cfg = &self.cfg.store;
+        progress.say(format!(
+            "C-STORE {} へ、{} を単位に {} 本のアソシエーション({} 接続まで同時)で送る",
+            cfg.target(),
+            cfg.unit.label(),
+            groups.len(),
+            cfg.connections.max(1)
+        ));
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let results: Vec<Result<store::Stats>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..cfg.connections.max(1) as usize)
+                .map(|k| {
+                    let (next, groups) = (&next, &groups);
+                    scope.spawn(move || {
+                        let r = self.store_worker(k, groups, next, progress);
+                        if let Err(e) = &r {
+                            progress.say(format!("エラー: 接続 {}: {e:#}", k + 1));
+                            // ほかの接続も止める。残りを送っても結果が片手落ちになるため
+                            progress.cancel.store(true, Ordering::Relaxed);
+                        }
+                        r
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap_or_else(|_| Err(anyhow::anyhow!("送信のスレッドが途中で止まった")))).collect()
+        });
+        let mut total = store::Stats::default();
+        let mut first_err = None;
+        let mut cancelled = false;
+        for r in results {
+            match r {
+                Ok(s) => total += s,
+                // ほかの接続の失敗を受けて止まった「中断した」より、本当の原因を先に伝える
+                Err(e) if e.to_string() == CANCELLED => cancelled = true,
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        progress.say(format!("送信 {} 個、受け側が拒否 {} 個", total.sent, total.rejected));
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        if cancelled {
+            progress.say(CANCELLED);
+            return Ok(total.sent);
+        }
+        if total.rejected > 0 {
+            bail!("{} 個が受け側に拒否された(ログを見てほしい)", total.rejected);
+        }
+        Ok(total.sent)
+    }
+
+    fn store_worker(&self, k: usize, groups: &[Group], next: &std::sync::atomic::AtomicUsize, progress: &Progress) -> Result<store::Stats> {
+        let cfg = &self.cfg.store;
+        let mut total = store::Stats::default();
+        loop {
+            if progress.cancel.load(Ordering::Relaxed) {
+                bail!(CANCELLED);
+            }
+            let g = next.fetch_add(1, Ordering::Relaxed);
+            let Some(group) = groups.get(g) else { break };
+            let (mut conn, refused) = store::Connection::open(cfg, &group.contexts).with_context(|| group.label.clone())?;
+            progress.say(format!("接続 {}: {} を張った({} 個、SOP Class {} 種)", k + 1, group.label, group.count, group.contexts.len()));
+            if !refused.is_empty() {
+                progress.say(format!("接続 {}: 受け側が受けつけない SOP Class(送れない): {}", k + 1, refused.join(", ")));
+            }
+            for (path, place, ixs) in &group.items {
+                let Some(prepared) = self.prepare(path, place, progress)? else { continue };
+                for &ix in ixs {
+                    if progress.cancel.load(Ordering::Relaxed) {
+                        let _ = conn.close();
+                        bail!(CANCELLED);
+                    }
+                    let (sop, ds) = self.make(&prepared, place, ix)?;
+                    if self.writes_files() {
+                        self.write(&ds, &sop, ix, path)?;
+                    }
+                    // ディスクを経由せず、複製したデータセットをそのまま送る
+                    let inst = store::Instance { sop_class: place.sop_class.clone(), sop_instance: sop, object: ds.into_inner() };
+                    match conn.store(&inst)? {
+                        store::Outcome::Sent => {}
+                        store::Outcome::Warned(st) => progress.say(format!("警告つきで受けつけた(status {st:04X}): {}", inst.sop_instance)),
+                        store::Outcome::Rejected(st) => progress.say(format!("受け側が拒否した(status {st:04X}): {}", inst.sop_instance)),
+                        store::Outcome::Unsupported => progress.say(format!("送れない: SOP Class {} を受け側が受けつけない({})", inst.sop_class, inst.sop_instance)),
+                    }
+                    progress.done.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            total += conn.close().with_context(|| group.label.clone())?;
+        }
+        Ok(total)
+    }
+
+    fn combos(&self) -> Vec<Idx> {
+        let c = &self.cfg;
+        let mut combos = Vec::with_capacity((c.patients * c.studies * c.series * c.images) as usize);
+        for p in 0..c.patients {
+            for s in 0..c.studies {
+                for r in 0..c.series {
+                    for i in 0..c.images {
+                        combos.push(Idx { p, s, r, i });
+                    }
+                }
+            }
+        }
+        combos
+    }
+
+    /// 1 複製を書く。`出力先/P患者/S検査/Rシリーズ/SOPInstanceUID.dcm`。
+    fn write(&self, ds: &dicom_object::DefaultDicomObject, sop: &str, ix: Idx, path: &Path) -> Result<()> {
+        let dir = Path::new(self.cfg.output.trim())
+            .join(format!("P{:06}", ix.p))
+            .join(format!("S{:03}", ix.s))
+            .join(format!("R{:03}", ix.r));
+        std::fs::create_dir_all(&dir)?;
+        // ファイルへ直接書くと、符号化に失敗したとき途中で切れた壊れたファイルが残る
+        let mut buf = Vec::new();
+        ds.write_all(&mut buf).with_context(|| path.display().to_string())?;
+        std::fs::write(dir.join(format!("{sop}.dcm")), buf)?;
+        Ok(())
     }
 
     /// 書き出す前に、CSV の全行(CSV を使わない規則は 1 回)を規則に当てて、書けない値を見つける。
@@ -474,7 +665,24 @@ impl Engine {
         Ok(())
     }
 
-    fn process(&self, path: &Path, place: &Place, progress: &Progress) -> Result<u64> {
+    /// ファイルに書く経路。元を 1 回読み、複製を並列に作って書く。
+    fn process_file(&self, path: &Path, place: &Place, progress: &Progress) -> Result<u64> {
+        let Some(prepared) = self.prepare(path, place, progress)? else { return Ok(0) };
+        let combos = self.combos();
+        combos.par_iter().try_for_each(|&ix| -> Result<()> {
+            if progress.cancel.load(Ordering::Relaxed) {
+                bail!(CANCELLED);
+            }
+            let (sop, ds) = self.make(&prepared, place, ix)?;
+            self.write(&ds, &sop, ix, path)?;
+            progress.done.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })?;
+        Ok(combos.len() as u64)
+    }
+
+    /// 元ファイルを読み、複製ごとに同じ結果になる書き換えを済ませておく。読めなければ None(飛ばす)。
+    fn prepare(&self, path: &Path, _place: &Place, progress: &Progress) -> Result<Option<Prepared>> {
         let c = &self.cfg;
         // 木を読めたファイルだけが来るが、念のため読めなければ飛ばす
         let mut src = match open_file(path) {
@@ -485,7 +693,7 @@ impl Engine {
                     c.patients as u64 * c.studies as u64 * c.series as u64 * c.images as u64,
                     Ordering::Relaxed,
                 );
-                return Ok(0);
+                return Ok(None);
             }
         };
         let src_scs = src
@@ -525,67 +733,45 @@ impl Engine {
             .and_then(|e| e.to_str().ok())
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(1);
+        Ok(Some(Prepared { src, flavor, keep_check, src_inst_no, path: path.to_path_buf() }))
+    }
 
-        let mut combos = Vec::new();
-        for p in 0..c.patients {
-            for s in 0..c.studies {
-                for r in 0..c.series {
-                    for i in 0..c.images {
-                        combos.push(Idx { p, s, r, i });
-                    }
-                }
+    /// `ix` の複製を作る。UID を振り直し、規則を当てる。(SOPInstanceUID, データセット) を返す。
+    fn make(&self, prepared: &Prepared, place: &Place, ix: Idx) -> Result<(String, dicom_object::DefaultDicomObject)> {
+        let c = &self.cfg;
+        let path = &prepared.path;
+        let mut ds = prepared.src.clone();
+        self.rewrite_uids(&mut ds, ix);
+
+        if let Some(code) = c.charset.code() {
+            ds.put_str(tags::SPECIFIC_CHARACTER_SET, VR::CS, code);
+        }
+        let ints = self.ints(ix, place, prepared.src_inst_no);
+        let strs = Self::strs(place);
+        for rule in &self.rules {
+            let vars = Vars { ints: &ints, strs: &strs, csv: self.csv_row(rule, ix, place) };
+            let text = rule.tpl.render(&vars).with_context(|| format!("{} ({})", rule.tag, path.display()))?;
+            // 元ファイルにある要素はその VR を、なければ辞書か規則の VR を使う。暗黙 VR のファイルでは
+            // 辞書にないタグが UN で読まれるので、UN は「決まっていない」として扱う
+            let source_vr = ds.get(rule.tag).map(|e| e.vr()).filter(|v| *v != VR::UN);
+            let Some(vr) = source_vr.or(rule.vr) else {
+                bail!("{} の VR が決まらない(元ファイルでは UN)。規則に /LO のように VR を添えてほしい", rule.tag)
+            };
+            if let Some((code, cs)) = &prepared.keep_check {
+                check_keep(vr, &text, code, cs.as_ref()).with_context(|| format!("{} {} ({})", rule.name, rule.tag, path.display()))?;
             }
+            put_value(&mut ds, rule.tag, vr, &text, prepared.flavor.as_ref())
+                .with_context(|| format!("{} {} ({})", rule.name, rule.tag, path.display()))?;
         }
 
-        combos.par_iter().try_for_each(|&ix| -> Result<()> {
-            if progress.cancel.load(Ordering::Relaxed) {
-                bail!(CANCELLED);
-            }
-            let mut ds = src.clone();
-            self.rewrite_uids(&mut ds, ix);
-
-            if let Some(code) = c.charset.code() {
-                ds.put_str(tags::SPECIFIC_CHARACTER_SET, VR::CS, code);
-            }
-            let ints = self.ints(ix, place, src_inst_no);
-            let strs = Self::strs(place);
-            for rule in &self.rules {
-                let vars = Vars { ints: &ints, strs: &strs, csv: self.csv_row(rule, ix, place) };
-                let text = rule.tpl.render(&vars).with_context(|| format!("{} ({})", rule.tag, path.display()))?;
-                // 元ファイルにある要素はその VR を、なければ辞書か規則の VR を使う。暗黙 VR のファイルでは
-                // 辞書にないタグが UN で読まれるので、UN は「決まっていない」として扱う
-                let source_vr = ds.get(rule.tag).map(|e| e.vr()).filter(|v| *v != VR::UN);
-                let Some(vr) = source_vr.or(rule.vr) else {
-                    bail!("{} の VR が決まらない(元ファイルでは UN)。規則に /LO のように VR を添えてほしい", rule.tag)
-                };
-                if let Some((code, cs)) = &keep_check {
-                    check_keep(vr, &text, code, cs.as_ref()).with_context(|| format!("{} {} ({})", rule.name, rule.tag, path.display()))?;
-                }
-                put_value(&mut ds, rule.tag, vr, &text, flavor.as_ref())
-                    .with_context(|| format!("{} {} ({})", rule.name, rule.tag, path.display()))?;
-            }
-
-            let sop = ds
-                .get(tags::SOP_INSTANCE_UID)
-                .map(|e| e.to_str().map(|s| s.trim_end_matches('\0').to_string()))
-                .transpose()?
-                .context("SOPInstanceUID がない")?;
-            ds.meta_mut().media_storage_sop_instance_uid = sop.clone();
-            ds.meta_mut().update_information_group_length();
-
-            let dir = Path::new(c.output.trim())
-                .join(format!("P{:06}", ix.p))
-                .join(format!("S{:03}", ix.s))
-                .join(format!("R{:03}", ix.r));
-            std::fs::create_dir_all(&dir)?;
-            // ファイルへ直接書くと、符号化に失敗したとき途中で切れた壊れたファイルが残る
-            let mut buf = Vec::new();
-            ds.write_all(&mut buf).with_context(|| path.display().to_string())?;
-            std::fs::write(dir.join(format!("{sop}.dcm")), buf)?;
-            progress.done.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        })?;
-        Ok(combos.len() as u64)
+        let sop = ds
+            .get(tags::SOP_INSTANCE_UID)
+            .map(|e| e.to_str().map(|s| s.trim_end_matches('\0').to_string()))
+            .transpose()?
+            .context("SOPInstanceUID がない")?;
+        ds.meta_mut().media_storage_sop_instance_uid = sop.clone();
+        ds.meta_mut().update_information_group_length();
+        Ok((sop, ds))
     }
 
     /// シーケンスの中まで辿って、UID のタグを置き換える。

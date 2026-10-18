@@ -760,6 +760,8 @@ dependencies = [
  "dicom-dictionary-std",
  "dicom-encoding",
  "dicom-object",
+ "dicom-transfer-syntax-registry",
+ "dicom-ul",
  "eframe",
  "encoding_rs",
  "rayon",
@@ -853,6 +855,20 @@ dependencies = [
  "jpeg-encoder",
  "jxl-oxide",
  "lazy_static",
+ "tracing",
+]
+
+[[package]]
+name = "dicom-ul"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96af12961f5e98687dba1b452f6facd3d5322d2440f5b6f6954859ff940b9ba0"
+dependencies = [
+ "byteordered",
+ "bytes",
+ "dicom-encoding",
+ "dicom-transfer-syntax-registry",
+ "snafu",
  "tracing",
 ]
 

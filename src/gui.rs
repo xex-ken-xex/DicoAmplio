@@ -139,6 +139,8 @@ struct App {
     csv_open: HashSet<usize>,
 
     job: Option<Job>,
+    /// C-ECHO を裏で試している最中
+    echo: Option<Receiver<Result<String, String>>>,
     log: Vec<String>,
 }
 
@@ -171,6 +173,7 @@ impl App {
             selection: Selection::default(),
             csv_open: HashSet::new(),
             job: None,
+            echo: None,
             log: vec!["起動した。元のディレクトリは、窓にフォルダをドロップしても指定できる".into()],
         };
         app.count_sources(&cc.egui_ctx);
@@ -181,9 +184,13 @@ impl App {
         self.log.push(msg.into());
     }
 
-    /// engine の中身を変える欄だけを残した設定。出力先や UID の接頭辞を打つたびに作り直さないため。
+    /// engine の中身を変える欄だけを残した設定。出力先や UID の接頭辞、送り先を打つたびに作り直さないため。
     fn engine_key(cfg: &Config) -> Config {
-        Config { input: String::new(), output: String::new(), uid_root: String::new(), ..cfg.clone() }
+        Config { input: String::new(), output: String::new(), uid_root: String::new(), store: Default::default(), ..cfg.clone() }
+    }
+
+    fn writes_files(&self) -> bool {
+        !self.cfg.store.enabled || self.cfg.store.also_write
     }
 
     fn refresh_engine(&mut self) {
@@ -221,6 +228,22 @@ impl App {
             ctx.request_repaint();
         });
         self.scan = Some(Scan { rx, done, total, cancel });
+    }
+
+    fn poll_echo(&mut self) {
+        let Some(rx) = &self.echo else { return };
+        match rx.try_recv() {
+            Ok(Ok(msg)) => {
+                self.log.push(msg);
+                self.echo = None;
+            }
+            Ok(Err(e)) => {
+                self.log.push(format!("エラー: {e}"));
+                self.echo = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => self.echo = None,
+        }
     }
 
     fn poll_scan(&mut self) {
@@ -303,11 +326,22 @@ impl App {
         if !Path::new(self.cfg.input.trim()).is_dir() {
             return Some("元のディレクトリがない".into());
         }
-        if self.cfg.output.trim().is_empty() {
-            return Some("出力先を指定してほしい".into());
+        if self.writes_files() {
+            if self.cfg.output.trim().is_empty() {
+                return Some("出力先を指定してほしい".into());
+            }
+            if Path::new(self.cfg.output.trim()) == Path::new(self.cfg.input.trim()) {
+                return Some("出力先が元のディレクトリと同じ".into());
+            }
         }
-        if Path::new(self.cfg.output.trim()) == Path::new(self.cfg.input.trim()) {
-            return Some("出力先が元のディレクトリと同じ".into());
+        if self.cfg.store.enabled {
+            let s = &self.cfg.store;
+            if s.host.trim().is_empty() || s.port == 0 {
+                return Some("送り先のホストとポートを指定してほしい".into());
+            }
+            if s.called_ae.trim().is_empty() || s.called_ae.trim().len() > 16 || s.calling_ae.trim().len() > 16 {
+                return Some("AE タイトルは 1〜16 文字".into());
+            }
         }
         if let Err(e) = &self.engine {
             return Some(e.clone());
@@ -367,8 +401,9 @@ impl App {
         let elapsed = job.started.elapsed();
         self.log.extend(lines);
         if let Some(r) = finished {
+            let verb = if self.cfg.store.enabled { "送信" } else { "書き出し" };
             match r {
-                Ok(n) => self.log.push(format!("書き出し {n} 個({:.1} 秒)", elapsed.as_secs_f64())),
+                Ok(n) => self.log.push(format!("{verb} {n} 個({:.1} 秒、{:.0} 個/秒)", elapsed.as_secs_f64(), n as f64 / elapsed.as_secs_f64().max(0.001))),
                 Err(e) => self.log.push(format!("エラー: {e}")),
             }
             self.job = None;
@@ -540,8 +575,15 @@ impl App {
                             ui.colored_label(WARN, format!("⚠ {p}"));
                         }
                         (None, Some(total)) => {
-                            ui.label(format!("元 {} 個 → 出力 {total} 個", self.sources.unwrap_or(0)));
-                            ui.weak(format!("→ {}", self.cfg.output.trim()));
+                            let verb = if self.cfg.store.enabled { "送信" } else { "出力" };
+                            ui.label(format!("元 {} 個 → {verb} {total} 個", self.sources.unwrap_or(0)));
+                            let s = &self.cfg.store;
+                            let dest = match (s.enabled, s.also_write) {
+                                (true, true) => format!("→ C-STORE {}({} 接続、{})と {}", s.target(), s.connections.max(1), s.unit.label(), self.cfg.output.trim()),
+                                (true, false) => format!("→ C-STORE {}({} 接続、{})", s.target(), s.connections.max(1), s.unit.label()),
+                                (false, _) => format!("→ {}", self.cfg.output.trim()),
+                            };
+                            ui.weak(dest);
                         }
                         (None, None) => {}
                     }
@@ -625,12 +667,75 @@ impl App {
                     ui.weak("フォルダを窓にドロップしても指定できる");
                 }
             }
-            ui.add_space(6.0);
-            Self::path_row(ui, "出力先", &mut self.cfg.output, Self::browse_dir);
-            ui.weak("出力は 出力先/P患者/S検査/Rシリーズ/SOPInstanceUID.dcm");
             if recount || self.counted_input != self.cfg.input && !ui.memory(|m| m.focused().is_some()) {
                 self.refresh_engine();
                 self.count_sources(&ctx);
+            }
+
+            Self::section(ui, "送り先");
+            let store = &mut self.cfg.store;
+            let mode = match (store.enabled, store.also_write) {
+                (false, _) => 0,
+                (true, false) => 1,
+                (true, true) => 2,
+            };
+            let labels = ["ファイルに書く", "C-STORE で送る(ディスクに書かない)", "送って、ファイルにも書く"];
+            let mut chosen = mode;
+            vw_ui::menu::combo("dest_mode").selected_text(labels[mode]).width(ui.available_width() - 8.0).show_ui(ui, |ui| {
+                for (k, l) in labels.iter().enumerate() {
+                    ui.selectable_value(&mut chosen, k, *l);
+                }
+            });
+            store.enabled = chosen > 0;
+            store.also_write = chosen == 2;
+            if store.enabled {
+                egui::Grid::new("store").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                    ui.label("ホスト");
+                    ui.add(egui::TextEdit::singleline(&mut store.host).desired_width(170.0));
+                    ui.end_row();
+                    ui.label("ポート");
+                    ui.add(egui::DragValue::new(&mut store.port).range(1..=65535).speed(1.0));
+                    ui.end_row();
+                    ui.label("相手の AE タイトル");
+                    ui.add(egui::TextEdit::singleline(&mut store.called_ae).desired_width(170.0).char_limit(16));
+                    ui.end_row();
+                    ui.label("自分の AE タイトル");
+                    ui.add(egui::TextEdit::singleline(&mut store.calling_ae).desired_width(170.0).char_limit(16));
+                    ui.end_row();
+                    ui.label("同時の接続数");
+                    ui.add(egui::DragValue::new(&mut store.connections).range(1..=64).speed(0.2));
+                    ui.end_row();
+                    ui.label("アソシエーションの単位");
+                    vw_ui::menu::combo("assoc_unit").selected_text(store.unit.label()).show_ui(ui, |ui| {
+                        for u in config::AssocUnit::ALL {
+                            ui.selectable_value(&mut store.unit, u, u.label());
+                        }
+                    });
+                    ui.end_row();
+                });
+                ui.horizontal(|ui| {
+                    let busy = self.echo.is_some();
+                    if ui.add_enabled(!busy, egui::Button::new("接続を試す(C-ECHO)")).clicked() {
+                        let cfg = self.cfg.store.clone();
+                        let (tx, rx) = mpsc::channel();
+                        let ctx = ctx.clone();
+                        std::thread::spawn(move || {
+                            let r = crate::store::echo(&cfg).map_err(|e| format!("{e:#}"));
+                            let _ = tx.send(r);
+                            ctx.request_repaint();
+                        });
+                        self.echo = Some(rx);
+                    }
+                    if busy {
+                        ui.weak("試している…");
+                    }
+                });
+                ui.weak("単位ごとにアソシエーションを張り、そのまとまりに要る SOP Class だけを提案して、送り切ったら解放する。私用の SOP Class も、受け側が受ければ送れる");
+            }
+            if self.writes_files() {
+                ui.add_space(6.0);
+                Self::path_row(ui, "出力先", &mut self.cfg.output, Self::browse_dir);
+                ui.weak("出力は 出力先/P患者/S検査/Rシリーズ/SOPInstanceUID.dcm");
             }
 
             Self::section(ui, "件数(元の 1 組を何倍にするか)");
@@ -1219,9 +1324,10 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.poll_job();
         self.poll_scan();
+        self.poll_echo();
         self.take_dropped(&ctx);
         self.refresh_engine();
-        if self.job.is_some() || self.scan.is_some() {
+        if self.job.is_some() || self.scan.is_some() || self.echo.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 

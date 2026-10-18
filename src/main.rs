@@ -8,6 +8,7 @@ mod engine;
 mod fonts;
 #[cfg(feature = "gui")]
 mod gui;
+mod store;
 mod template;
 mod tree;
 
@@ -37,8 +38,26 @@ CSV を指定すると、列名がそのまま変数(文字列)になる。
 struct Args {
     /// 元の画像セットのディレクトリ(再帰的に探す)
     input: Option<String>,
-    /// 出力先ディレクトリ
+    /// 出力先ディレクトリ(--send だけのときは省略できる)
     output: Option<String>,
+    /// C-STORE で送る先 `AET@host:port`。指定すると、ディスクに書かずにメモリから直接送る
+    #[arg(long, value_name = "AET@HOST:PORT")]
+    send: Option<String>,
+    /// 送るときの自分の AE タイトル
+    #[arg(long)]
+    calling_ae: Option<String>,
+    /// 同時に張るアソシエーションの数
+    #[arg(long)]
+    connections: Option<u32>,
+    /// 1 つのアソシエーションで送るまとまり(既定はモダリティごと)
+    #[arg(long, value_enum)]
+    assoc_unit: Option<config::AssocUnit>,
+    /// 送るのに加えて、出力先にも書く
+    #[arg(long)]
+    also_write: bool,
+    /// C-ECHO で送り先との接続を試して終わる(--send と一緒に)
+    #[arg(long)]
+    echo: bool,
     /// 患者の複製数(元を 1 組とした総数)
     #[arg(long)]
     patients: Option<u32>,
@@ -122,6 +141,21 @@ fn build_config(a: &Args, dir: &Path) -> Result<Config> {
     if let Some(v) = &a.uid_root {
         c.uid_root = v.clone();
     }
+    if let Some(t) = &a.send {
+        c.store.parse_target(t)?;
+    }
+    if let Some(v) = &a.calling_ae {
+        c.store.calling_ae = v.clone();
+    }
+    if let Some(v) = a.connections {
+        c.store.connections = v.max(1);
+    }
+    if let Some(u) = a.assoc_unit {
+        c.store.unit = u;
+    }
+    if a.also_write {
+        c.store.also_write = true;
+    }
     if let Some(f) = &a.rules {
         let text = std::fs::read_to_string(f).with_context(|| format!("規則ファイルを読めない: {}", f.display()))?;
         for l in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
@@ -154,7 +188,15 @@ fn main() -> Result<()> {
         cfg.save(&path)?;
         eprintln!("プリセットを保存した: {}", path.display());
     }
-    if cfg.input.trim().is_empty() || cfg.output.trim().is_empty() {
+    if args.echo {
+        if !cfg.store.enabled {
+            anyhow::bail!("--echo には --send AET@host:port が要る");
+        }
+        eprintln!("{}", store::echo(&cfg.store)?);
+        return Ok(());
+    }
+    let needs_output = !cfg.store.enabled || cfg.store.also_write;
+    if cfg.input.trim().is_empty() || (needs_output && cfg.output.trim().is_empty()) {
         if args.save_preset.is_some() {
             return Ok(());
         }
@@ -165,8 +207,8 @@ fn main() -> Result<()> {
         rayon::ThreadPoolBuilder::new().num_threads(args.threads).build_global()?;
     }
     let progress = Progress { echo: true, ..Default::default() };
-    let written = Engine::new(&cfg)?.run(&progress)?;
-    eprintln!("書き出し {written} 個");
+    let done = Engine::new(&cfg)?.run(&progress)?;
+    eprintln!("{} {done} 個", if cfg.store.enabled { "送信" } else { "書き出し" });
     Ok(())
 }
 

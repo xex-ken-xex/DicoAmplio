@@ -29,6 +29,8 @@ toml = "1"
 vw-ui = { git = "https://github.com/xex-ken-xex/vw", rev = "7220d326c273494b3443bc4fc790e1d1de5846e8", optional = true }
 eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"], optional = true }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"], optional = true }
+dicom-ul = "0.8"
+dicom-transfer-syntax-registry = "0.8"
 
 [profile.release]
 opt-level = 3

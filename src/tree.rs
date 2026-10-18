@@ -8,10 +8,12 @@
 //! 文字列は、複数値の ISO 2022 なら自前で読み直す(dicom-rs は先頭の値だけで読み、ESC が残る)。
 
 use crate::charset::{is_multi_iso2022, scs_values, Iso2022};
-use anyhow::Result;
+use anyhow::{bail, Result};
 use dicom_core::Tag;
 use dicom_dictionary_std::tags;
+use dicom_encoding::TransferSyntaxIndex;
 use dicom_object::{InMemDicomObject, OpenFileOptions};
+use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -70,6 +72,9 @@ pub struct Place {
     pub series_number: String,
     pub series_description: String,
     pub modality: String,
+    /// 送信の提示コンテキストに要る
+    pub sop_class: String,
+    pub transfer_syntax: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -132,8 +137,11 @@ impl SourceTree {
             series_number: r.number.clone(),
             series_description: r.description.clone(),
             modality: r.modality.clone(),
+            sop_class: String::new(),
+            transfer_syntax: String::new(),
         })
     }
+
 }
 
 /// 1 ファイルから木を作るのに要る分。
@@ -149,6 +157,8 @@ struct Record {
     modality: String,
     series_desc: String,
     inst: Option<i64>,
+    sop_class: String,
+    transfer_syntax: String,
 }
 
 fn text(obj: &InMemDicomObject, tag: Tag, iso: Option<&Iso2022>) -> String {
@@ -176,7 +186,22 @@ fn read(path: &Path) -> Result<Record> {
         .unwrap_or_default();
     let iso = if is_multi_iso2022(&scs) { Iso2022::from_values(&scs) } else { None };
     let t = |tag| text(&obj, tag, iso.as_ref());
+    let meta_sop = obj.meta().media_storage_sop_class_uid().trim_end_matches(['\0', ' ']).to_string();
+    let sop_class = if meta_sop.is_empty() { t(tags::SOP_CLASS_UID) } else { meta_sop };
+    let transfer_syntax = obj.meta().transfer_syntax().trim_end_matches(['\0', ' ']).to_string();
+    // ヘッダだけを読む経路は、データセットを読めない転送構文(Deflated など)でも失敗せずに空の
+    // オブジェクトを返す。空のまま木に入れると、空の SOP Class で送ろうとして分かりにくく失敗する
+    match TransferSyntaxRegistry.get(&transfer_syntax) {
+        None => bail!("転送構文 {transfer_syntax} を知らない"),
+        Some(ts) if ts.is_unsupported() => bail!("転送構文 {} ({transfer_syntax}) は読めない", ts.name()),
+        _ => {}
+    }
+    if t(tags::SOP_INSTANCE_UID).is_empty() {
+        bail!("SOPInstanceUID がない(DICOM のデータセットとして読めない)");
+    }
     Ok(Record {
+        sop_class,
+        transfer_syntax,
         patient_id: t(tags::PATIENT_ID),
         patient_name: t(tags::PATIENT_NAME),
         study_uid: t(tags::STUDY_INSTANCE_UID),
@@ -209,7 +234,7 @@ fn build(records: Vec<(PathBuf, Result<Record>)>) -> SourceTree {
     // 患者 → 検査 → シリーズの順に、UID で寄せる。患者は ID と名前の組で分ける
     struct SeriesAcc {
         series: Series,
-        files: Vec<(Option<i64>, PathBuf)>,
+        files: Vec<(Option<i64>, PathBuf, String, String)>,
     }
     type SeriesMap = BTreeMap<String, SeriesAcc>;
     type StudyMap = BTreeMap<String, (Study, SeriesMap)>;
@@ -248,7 +273,7 @@ fn build(records: Vec<(PathBuf, Result<Record>)>) -> SourceTree {
                 None => (n, n),
             });
         }
-        acc.files.push((r.inst, path));
+        acc.files.push((r.inst, path, r.sop_class, r.transfer_syntax));
     }
     let (mut ordinal, mut study_ordinal, mut series_ordinal): (u64, u64, u64) = (0, 0, 0);
     for (pi, ((id, name), studies)) in patients.into_iter().enumerate() {
@@ -262,11 +287,11 @@ fn build(records: Vec<(PathBuf, Result<Record>)>) -> SourceTree {
             // シリーズ番号の順(読めない番号は後ろ)
             list.sort_by_key(|a| (a.series.number.trim().parse::<i64>().unwrap_or(i64::MAX), a.series.uid.clone()));
             for (ri, mut acc) in list.into_iter().enumerate() {
-                acc.files.sort_by_key(|(inst, path)| (inst.unwrap_or(i64::MAX), path.clone()));
+                acc.files.sort_by_key(|(inst, path, _, _)| (inst.unwrap_or(i64::MAX), path.clone()));
                 acc.series.first_ordinal = ordinal;
                 acc.series.ordinal = series_ordinal;
                 series_ordinal += 1;
-                for (ii, (_, path)) in acc.files.into_iter().enumerate() {
+                for (ii, (_, path, sop_class, transfer_syntax)) in acc.files.into_iter().enumerate() {
                     tree.places.insert(
                         path,
                         Place {
@@ -284,6 +309,8 @@ fn build(records: Vec<(PathBuf, Result<Record>)>) -> SourceTree {
                             series_number: acc.series.number.clone(),
                             series_description: acc.series.description.clone(),
                             modality: acc.series.modality.clone(),
+                            sop_class,
+                            transfer_syntax,
                         },
                     );
                     ordinal += 1;
@@ -316,8 +343,17 @@ mod tests {
                 modality: "CT".into(),
                 series_desc: String::new(),
                 inst: Some(inst),
+                sop_class: "1.2.840.10008.5.1.4.1.1.2".into(),
+                transfer_syntax: "1.2.840.10008.1.2.1".into(),
             }),
         )
+    }
+
+    #[test]
+    fn sop_class_and_transfer_syntax_are_kept_per_file() {
+        let t = build(vec![rec("A", "s1", "r1", "1", 1)]);
+        let p = t.places.values().next().unwrap();
+        assert_eq!((p.sop_class.as_str(), p.transfer_syntax.as_str()), ("1.2.840.10008.5.1.4.1.1.2", "1.2.840.10008.1.2.1"));
     }
 
     #[test]

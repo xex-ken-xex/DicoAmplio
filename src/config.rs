@@ -98,6 +98,94 @@ impl RuleSpec {
     }
 }
 
+/// 1 つのアソシエーションで送るまとまり。実機の装置は検査(モダリティ)の単位で送るので、
+/// 混ぜて送ると PACS 側で取り違えが起きやすい。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum AssocUnit {
+    /// モダリティごと(CT だけ、MR だけ、で 1 本)
+    #[default]
+    Modality,
+    /// 複製後の検査ごと
+    Study,
+    /// 複製後のシリーズごと
+    Series,
+    /// 複製後の患者ごと
+    Patient,
+    /// 分けない(接続の数に均等に割る)
+    All,
+}
+
+impl AssocUnit {
+    pub const ALL: [AssocUnit; 5] = [AssocUnit::Modality, AssocUnit::Study, AssocUnit::Series, AssocUnit::Patient, AssocUnit::All];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AssocUnit::Modality => "モダリティごと",
+            AssocUnit::Study => "検査ごと",
+            AssocUnit::Series => "シリーズごと",
+            AssocUnit::Patient => "患者ごと",
+            AssocUnit::All => "分けない",
+        }
+    }
+}
+
+/// C-STORE の送り先。`enabled` のときは、複製をディスクに書かずにそのまま送る(`also_write` なら両方)。
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoreConfig {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    pub called_ae: String,
+    pub calling_ae: String,
+    /// 同時に張るアソシエーションの数
+    pub connections: u32,
+    /// 1 つのアソシエーションで送るまとまり
+    pub unit: AssocUnit,
+    pub also_write: bool,
+}
+
+impl Default for StoreConfig {
+    fn default() -> Self {
+        StoreConfig {
+            enabled: false,
+            host: "127.0.0.1".into(),
+            port: 104,
+            called_ae: "ANY-SCP".into(),
+            calling_ae: "DICOAMPLIO".into(),
+            connections: 4,
+            unit: AssocUnit::default(),
+            also_write: false,
+        }
+    }
+}
+
+impl StoreConfig {
+    /// `AET@host:port` の形から。AET は省略できる(`host:port`)。
+    pub fn parse_target(&mut self, s: &str) -> Result<()> {
+        let (ae, addr) = match s.split_once('@') {
+            Some((ae, addr)) => (Some(ae.trim()), addr.trim()),
+            None => (None, s.trim()),
+        };
+        let (host, port) = addr.rsplit_once(':').with_context(|| format!("送り先は AET@host:port の形: {s}"))?;
+        if host.is_empty() {
+            bail!("送り先のホストが空: {s}");
+        }
+        self.port = port.parse().with_context(|| format!("送り先のポートが数でない: {port}"))?;
+        self.host = host.to_string();
+        if let Some(ae) = ae.filter(|a| !a.is_empty()) {
+            self.called_ae = ae.to_string();
+        }
+        self.enabled = true;
+        Ok(())
+    }
+
+    pub fn target(&self) -> String {
+        format!("{}@{}:{}", self.called_ae, self.host, self.port)
+    }
+}
+
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -111,6 +199,7 @@ pub struct Config {
     pub uid_root: String,
     pub csv: String,
     pub csv_encoding: CsvEncoding,
+    pub store: StoreConfig,
     #[serde(rename = "rule")]
     pub rules: Vec<RuleSpec>,
 }
@@ -128,6 +217,7 @@ impl Default for Config {
             uid_root: "2.25".into(),
             csv: String::new(),
             csv_encoding: CsvEncoding::default(),
+            store: StoreConfig::default(),
             rules: Vec::new(),
         }
     }
@@ -222,6 +312,18 @@ mod tests {
         assert!(preset_path(d, "a/b").is_err());
         assert!(preset_path(d, ".hidden").is_err());
         assert_eq!(preset_path(d, "日本人患者").unwrap(), d.join("日本人患者.toml"));
+    }
+
+    #[test]
+    fn store_target_parses_ae_title_host_and_port() {
+        let mut s = StoreConfig::default();
+        s.parse_target("PACS@10.0.0.5:11112").unwrap();
+        assert_eq!((s.called_ae.as_str(), s.host.as_str(), s.port, s.enabled), ("PACS", "10.0.0.5", 11112, true));
+        let mut s = StoreConfig::default();
+        s.parse_target("localhost:104").unwrap();
+        assert_eq!((s.called_ae.as_str(), s.host.as_str()), ("ANY-SCP", "localhost"));
+        assert!(StoreConfig::default().parse_target("PACS@host").is_err());
+        assert!(StoreConfig::default().parse_target("PACS@host:abc").is_err());
     }
 
     #[test]
