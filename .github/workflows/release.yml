@@ -1,0 +1,72 @@
+name: release
+
+# v* のタグを push すると、Linux と Windows の実行ファイルを作って Release に添付する。
+# 手動実行(workflow_dispatch)では Release は作らず、成果物だけを確かめられる。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: linux-x86_64
+            exe: dicoamplio
+          - os: windows-latest
+            target: windows-x86_64
+            exe: dicoamplio.exe
+    runs-on: ${{ matrix.os }}
+    env:
+      # Windows は C ランタイムを実行ファイルに含め、VC++ 再頒布可能パッケージなしで動くようにする
+      RUSTFLAGS: ${{ matrix.os == 'windows-latest' && '-C target-feature=+crt-static' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release
+      - run: cargo build --release
+      - name: Package
+        shell: bash
+        run: |
+          name="dicoamplio-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/release/${{ matrix.exe }}" README.md "dist/$name/"
+          cp -r presets examples "dist/$name/"
+          cd dist
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            7z a "$name.zip" "$name" > /dev/null
+          else
+            tar czf "$name.tar.gz" "$name"
+          fi
+          rm -rf "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dicoamplio-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the release and attach the files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --title "DicoAmplio $GITHUB_REF_NAME" --generate-notes
