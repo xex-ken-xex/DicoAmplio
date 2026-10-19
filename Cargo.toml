@@ -32,6 +32,10 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "a
 dicom-ul = "0.8"
 dicom-transfer-syntax-registry = "0.8"
 
+# Windows で、コマンドラインから使うときに起動元のコンソールへ出力をつなぐ(main.rs の attach_console)
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

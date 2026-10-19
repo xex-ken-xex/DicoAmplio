@@ -499,9 +499,7 @@ impl Engine {
             if self.cfg.store.enabled { "送信" } else { "出力" },
             progress.total.load(Ordering::Relaxed)
         ));
-        for s in &tree.skipped {
-            progress.say(format!("飛ばした: {s}"));
-        }
+        tree::log_skipped(&tree.skipped, |m| progress.say(m));
         if self.cfg.store.enabled {
             return self.run_store(&tree, &files, progress);
         }
@@ -568,9 +566,7 @@ impl Engine {
         let c = tree.counts();
         progress.total.store(tree.files as u64, Ordering::Relaxed);
         progress.say(format!("そのまま送る: {} 患者 / {} 検査 / {} シリーズ / {} 画像({} ファイル)", c.patients, c.studies, c.series, c.images, tree.files));
-        for s in &tree.skipped {
-            progress.say(format!("飛ばした: {s}"));
-        }
+        tree::log_skipped(&tree.skipped, |m| progress.say(m));
         // 複製の番号は使わないので、全部 0 のまま。単位の分け方(モダリティ・検査…)はそのまま効く
         let one = Engine { cfg: Config { patients: 1, studies: 1, series: 1, images: 1, ..self.cfg.clone() }, ..self.shallow() };
         let groups = one.groups(&tree, &files);
@@ -1118,7 +1114,7 @@ fn parse_rule(spec: &RuleSpec, table: Option<Arc<Table>>) -> Result<Rule> {
     Ok(Rule { tag, name, vr, tpl, value: spec.value.clone(), table, level })
 }
 
-/// 元のディレクトリにあるファイル(再帰。DICOMDIR は除く)。
+/// 元のディレクトリにあるファイル(再帰)。DICOM でないものや DICOMDIR も入る。読むときに飛ばして、ログに出す。
 pub fn list_sources(input: &str) -> Result<Vec<PathBuf>> {
     let input = input.trim();
     if input.is_empty() {
@@ -1130,7 +1126,7 @@ pub fn list_sources(input: &str) -> Result<Vec<PathBuf>> {
     Ok(WalkDir::new(input)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file() && !e.file_name().to_string_lossy().eq_ignore_ascii_case("DICOMDIR"))
+        .filter(|e| e.file_type().is_file())
         .map(|e| e.into_path())
         .collect())
 }

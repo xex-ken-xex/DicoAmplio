@@ -1,5 +1,9 @@
 //! DICOM のタグを書き換えて、患者・検査・シリーズ・画像を水増しする。
 //! 引数なしで起動すると画面(GUI)が開く。引数があればコマンドラインで動く。
+//!
+//! Windows では GUI サブシステムで作る(ダブルクリックで黒いコンソールの窓が出ないように)。
+//! コマンドラインで使うときは、起動元のコンソールにつなぎ直して出力する(`attach_console`)。
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod charset;
 mod config;
@@ -175,7 +179,24 @@ fn build_config(a: &Args, dir: &Path) -> Result<Config> {
     Ok(c)
 }
 
+/// Windows の GUI サブシステムは、コンソールから起動されても標準出力・標準エラーがつながっていない。
+/// 引数があるとき(コマンドラインの使い方)だけ、起動元のコンソールにつなぐ。ダブルクリックでは何もしない。
+#[cfg(windows)]
+fn attach_console() {
+    use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    // SAFETY: 引数なしの Win32 API。親にコンソールがなければ失敗して返るだけ
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_console() {}
+
 fn main() -> Result<()> {
+    if std::env::args().len() > 1 {
+        attach_console();
+    }
     let args = Args::parse();
     let dir = args.preset_dir.clone().unwrap_or_else(config::default_preset_dir);
 

@@ -273,9 +273,9 @@ impl App {
         let Some(s) = &self.scan else { return };
         match s.rx.try_recv() {
             Ok(t) => {
-                if !t.skipped.is_empty() {
-                    self.log.push(format!("元のディレクトリで DICOM として読めなかったファイル {} 個(書き出しでも飛ばす)", t.skipped.len()));
-                }
+                tree::log_skipped(&t.skipped, |m| self.log.push(m));
+                // 「元 N 個」は読めたファイルの数にする(DICOM でないものや DICOMDIR を除く)
+                self.sources = Some(t.files);
                 self.tree = Some(Arc::new(t));
                 self.scan = None;
             }

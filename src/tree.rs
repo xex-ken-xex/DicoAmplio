@@ -177,8 +177,25 @@ fn text(obj: &InMemDicomObject, tag: Tag, iso: Option<&Iso2022>) -> String {
     raw
 }
 
+/// DICOMDIR(媒体の目次)の SOP Class。画像ではないので飛ばす。
+const MEDIA_STORAGE_DIRECTORY: &str = "1.2.840.10008.1.3.10";
+
+/// 読めない理由を、ログで見分けられる言葉にする。DICOM でないファイル(テキストや画像の JPEG など)、
+/// DICOMDIR、壊れているか転送構文を読めない DICOM の 3 つを分ける。
 fn read(path: &Path) -> Result<Record> {
-    let obj = OpenFileOptions::new().read_until(tags::PIXEL_DATA).open_file(path)?;
+    if path.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("DICOMDIR")) {
+        bail!("DICOMDIR(目次ファイル)");
+    }
+    // 先頭 128 バイトの前置きのあとに DICM の印がなければ DICOM ではない(dicom-rs も印を要求する)
+    let mut head = [0u8; 132];
+    let whole = std::fs::File::open(path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head));
+    match whole {
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => bail!("DICOM ではない(132 バイトに満たない)"),
+        Err(e) => bail!("開けない: {e}"),
+        Ok(()) if &head[128..] != b"DICM" => bail!("DICOM ではない(DICM の印がない)"),
+        Ok(()) => {}
+    }
+    let obj = OpenFileOptions::new().read_until(tags::PIXEL_DATA).open_file(path).map_err(|e| anyhow::anyhow!("DICOM として読めない: {e}"))?;
     let scs = obj
         .get(tags::SPECIFIC_CHARACTER_SET)
         .and_then(|e| e.to_str().ok())
@@ -188,6 +205,9 @@ fn read(path: &Path) -> Result<Record> {
     let t = |tag| text(&obj, tag, iso.as_ref());
     let meta_sop = obj.meta().media_storage_sop_class_uid().trim_end_matches(['\0', ' ']).to_string();
     let sop_class = if meta_sop.is_empty() { t(tags::SOP_CLASS_UID) } else { meta_sop };
+    if sop_class == MEDIA_STORAGE_DIRECTORY {
+        bail!("DICOMDIR(目次ファイル)");
+    }
     let transfer_syntax = obj.meta().transfer_syntax().trim_end_matches(['\0', ' ']).to_string();
     // ヘッダだけを読む経路は、データセットを読めない転送構文(Deflated など)でも失敗せずに空の
     // オブジェクトを返す。空のまま木に入れると、空の SOP Class で送ろうとして分かりにくく失敗する
@@ -214,6 +234,22 @@ fn read(path: &Path) -> Result<Record> {
         series_desc: t(tags::SERIES_DESCRIPTION),
         inst: t(tags::INSTANCE_NUMBER).trim().parse().ok(),
     })
+}
+
+/// 飛ばしたファイルの一覧を 1 行ずつ出す。多すぎるときは途中で切って数だけ出す(ログを埋めないため)。
+pub const SKIPPED_LOG_LINES: usize = 200;
+
+pub fn log_skipped(skipped: &[String], mut say: impl FnMut(String)) {
+    if skipped.is_empty() {
+        return;
+    }
+    say(format!("飛ばしたファイル {} 個(DICOM でない・DICOMDIR・読めない DICOM):", skipped.len()));
+    for s in skipped.iter().take(SKIPPED_LOG_LINES) {
+        say(format!("  飛ばした: {s}"));
+    }
+    if skipped.len() > SKIPPED_LOG_LINES {
+        say(format!("  …ほか {} 個", skipped.len() - SKIPPED_LOG_LINES));
+    }
 }
 
 /// ファイルを並列に読んで木にする。`done` は読んだ数(進み具合の表示用)、`cancel` で途中でやめる。
