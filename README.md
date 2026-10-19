@@ -1,5 +1,7 @@
 # DicoAmplio
 
+> **このリポジトリは移転した。** 続きは [vw の `apps/dicoamplio`](https://github.com/xex-ken-xex/vw/tree/main/apps/dicoamplio) にある(見た目のクレートを vw と共有するため、同じワークスペースに入れた)。配布物も vw の Releases に並ぶ。ここはアーカイブして残す。
+
 DICOM のタグを書き換えて、評価用に患者・検査・シリーズ・画像を水増しする(Rust、rayon で並列)。
 引数なしで起動すると画面が開く。画面の見た目は [vw](https://github.com/xex-ken-xex/vw) と同じ。
 
